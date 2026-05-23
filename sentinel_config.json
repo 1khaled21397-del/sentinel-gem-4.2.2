@@ -639,10 +639,11 @@
   },
   "sentiment": {
     "primary_source": "mubasher",
-    "dual_ai": {
+    "triple_ai": {
       "enabled": true,
-      "claude_weight": 0.6,
-      "kimi_weight": 0.4,
+      "claude_weight": 0.4,
+      "kimi_weight": 0.3,
+      "gemini_weight": 0.3,
       "batch_size": 20,
       "top_liquid_tickers_only": true
     },
