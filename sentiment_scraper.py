@@ -1,14 +1,8 @@
 """
 Sentinel-EGX v4.2.1 — Sentiment Scraper
-=========================================
+========================================
 Keyword-based sentiment scoring + Dual AI (Claude + Kimi) sentiment analysis
-NEW v4.2.1:
-  - HTTP-based AI calls (no SDK dependencies)
-  - Verified endpoints: Claude (api.anthropic.com) + Kimi (api.moonshot.cn)
-  - Config-driven weights (claude_weight=0.6, kimi_weight=0.4)
-  - Graceful fallback to keyword scoring
-  - Fires on every ticker analysis (not just top liquid)
-  - Exports API keys to os.environ for child modules
+NEW: HTTP-based AI calls (no SDK dependencies), config-driven weights, graceful fallback
 """
 
 import re
@@ -40,48 +34,41 @@ NEUTRAL_KEYWORDS = [
     "pending", "review", "monitor", "neutral", "mixed", "uncertain", "cautious"
 ]
 
-# Load config for dual AI settings
+# Load config for triple AI settings
 CONFIG_PATH = "sentinel_config.json"
-DUAL_AI_ENABLED = False
-CLAUDE_WEIGHT = 0.6
-KIMI_WEIGHT = 0.4
+TRIPLE_AI_ENABLED = False
+CLAUDE_WEIGHT = 0.4
+KIMI_WEIGHT = 0.3
+GEMINI_WEIGHT = 0.3
 BATCH_SIZE = 20
 
 try:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     sentiment_cfg = cfg.get("sentiment", {})
-    dual_ai_cfg = sentiment_cfg.get("dual_ai", {})
-    DUAL_AI_ENABLED = dual_ai_cfg.get("enabled", False)
-    CLAUDE_WEIGHT = dual_ai_cfg.get("claude_weight", 0.6)
-    KIMI_WEIGHT = dual_ai_cfg.get("kimi_weight", 0.4)
-    BATCH_SIZE = dual_ai_cfg.get("batch_size", 20)
+    triple_ai_cfg = sentiment_cfg.get("triple_ai", {})
+    TRIPLE_AI_ENABLED = triple_ai_cfg.get("enabled", False)
+    CLAUDE_WEIGHT = triple_ai_cfg.get("claude_weight", 0.4)
+    KIMI_WEIGHT = triple_ai_cfg.get("kimi_weight", 0.3)
+    GEMINI_WEIGHT = triple_ai_cfg.get("gemini_weight", 0.3)
+    BATCH_SIZE = triple_ai_cfg.get("batch_size", 20)
 except Exception:
     pass
 
-# API Keys — try os.environ first (exported by sentinel_app), then Streamlit secrets
+# API Keys
 CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 KIMI_API_KEY = os.getenv("KIMI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Fallback to Streamlit secrets
-if not CLAUDE_API_KEY or not KIMI_API_KEY:
+# Try Streamlit secrets
+if not CLAUDE_API_KEY or not KIMI_API_KEY or not GEMINI_API_KEY:
     try:
         import streamlit as st
-        if not CLAUDE_API_KEY:
-            CLAUDE_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "").strip()
-        if not KIMI_API_KEY:
-            # Try both flat and nested secret formats
-            KIMI_API_KEY = st.secrets.get("KIMI_API_KEY", "").strip()
-            if not KIMI_API_KEY and "sentinel" in st.secrets:
-                sentinel_cfg = st.secrets.get("sentinel", {})
-                if isinstance(sentinel_cfg, dict):
-                    KIMI_API_KEY = sentinel_cfg.get("KIMI_API_KEY", "").strip()
+        CLAUDE_API_KEY = CLAUDE_API_KEY or st.secrets.get("ANTHROPIC_API_KEY", "").strip()
+        KIMI_API_KEY = KIMI_API_KEY or st.secrets.get("KIMI_API_KEY", "").strip()
+        GEMINI_API_KEY = GEMINI_API_KEY or st.secrets.get("GEMINI_API_KEY", "").strip()
     except Exception:
         pass
-
-# Export back to environment
-os.environ["ANTHROPIC_API_KEY"] = CLAUDE_API_KEY
-os.environ["KIMI_API_KEY"] = KIMI_API_KEY
 
 
 @dataclass
@@ -122,15 +109,14 @@ def score_text(text: str) -> Dict:
 
 
 def _call_claude(headlines: List[str]) -> Optional[Dict]:
-    """Call Claude API via HTTP for sentiment analysis.
-    Endpoint verified: https://api.anthropic.com/v1/messages
-    Model: claude-3-haiku-20240307 (fast, cheap, sufficient for sentiment)
-    """
+    """Call Claude API via HTTP for specialized Geopolitical & Macroeconomic Risk analysis."""
     if not CLAUDE_API_KEY:
         return None
 
-    prompt = f"""Analyze the sentiment of these Egyptian stock market headlines.
-Score from -1.0 (very bearish) to +1.0 (very bullish).
+    prompt = f"""You are a senior macroeconomic analyst specializing in the Egyptian stock market (EGX).
+Analyze the following headlines, focusing specifically on Geopolitical risks, Macroeconomic factors (inflation, devaluation, interest rates), and Regulatory/Policy changes.
+Assess how these broader themes impact long-term corporate outlooks.
+Score the net sentiment from -1.0 (very bearish) to +1.0 (very bullish).
 Provide a single JSON object with keys: score, confidence (0-1), summary (1 sentence).
 
 Headlines:
@@ -139,8 +125,9 @@ Headlines:
 Respond ONLY with valid JSON."""
 
     try:
+        url = "https://api.anthropic.com/v1/messages"
         resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            url,
             headers={
                 "x-api-key": CLAUDE_API_KEY,
                 "anthropic-version": "2023-06-01",
@@ -166,15 +153,13 @@ Respond ONLY with valid JSON."""
 
 
 def _call_kimi(headlines: List[str]) -> Optional[Dict]:
-    """Call Kimi API via HTTP for sentiment analysis.
-    Endpoint verified: https://api.moonshot.cn/v1/chat/completions
-    Model: moonshot-v1-8k (sufficient for sentiment, cheapest option)
-    """
+    """Call Kimi API via HTTP for specialized Retail Momentum & Short-Term Flow analysis."""
     if not KIMI_API_KEY:
         return None
 
-    prompt = f"""Analyze the sentiment of these Egyptian stock market headlines.
-Score from -1.0 (very bearish) to +1.0 (very bullish).
+    prompt = f"""You are a specialized momentum trader analyzing EGX retail investor behavior and trading flows.
+Analyze the following headlines, focusing specifically on retail excitement, short-term momentum triggers, volume surges, chart breakout news, and trading activity/liquidity.
+Score the short-term sentiment from -1.0 (very bearish) to +1.0 (very bullish).
 Provide a single JSON object with keys: score, confidence (0-1), summary (1 sentence).
 
 Headlines:
@@ -208,15 +193,58 @@ Respond ONLY with valid JSON."""
         return None
 
 
-def _dual_ai_sentiment(headlines: List[str]) -> Optional[Dict]:
-    """Combine Claude + Kimi sentiment scores with config weights.
-    Fires on every ticker analysis (not just top liquid).
-    """
-    if not DUAL_AI_ENABLED:
+def _call_gemini(headlines: List[str]) -> Optional[Dict]:
+    """Call Gemini API via HTTP for specialized Earnings & Fundamental Growth analysis."""
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = f"""You are a fundamental equity analyst specializing in EGX corporate performance.
+Analyze the following headlines, focusing specifically on hard fundamental figures: earnings surprises, quarterly profits/losses, revenue growth, profit margin adjustments, dividends, mergers, acquisitions, and core business expansions.
+Score the fundamental sentiment from -1.0 (very bearish) to +1.0 (very bullish).
+Provide a single JSON object with keys: score, confidence (0-1), summary (1 sentence).
+
+Headlines:
+{chr(10).join(f"- {h}" for h in headlines)}
+
+Respond ONLY with valid JSON."""
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        res_json = resp.json()
+        content = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        
+        # Extract JSON from response
+        json_match = re.search(r'\{[^}]*"score"[^}]*\}', content)
+        if json_match:
+            return json.loads(json_match.group())
+        return None
+    except Exception as e:
+        print(f"[Sentiment] Gemini API error: {e}")
+        return None
+
+
+def _triple_ai_sentiment(headlines: List[str]) -> Optional[Dict]:
+    """Combine Claude + Kimi + Gemini sentiment scores with config weights."""
+    if not TRIPLE_AI_ENABLED:
         return None
 
     claude_result = _call_claude(headlines)
     kimi_result = _call_kimi(headlines)
+    gemini_result = _call_gemini(headlines)
 
     scores = []
     confs = []
@@ -232,12 +260,24 @@ def _dual_ai_sentiment(headlines: List[str]) -> Optional[Dict]:
         confs.append(kimi_result.get("confidence", 0.5) * KIMI_WEIGHT)
         sources.append("kimi")
 
+    if gemini_result and "score" in gemini_result:
+        scores.append(gemini_result["score"] * GEMINI_WEIGHT)
+        confs.append(gemini_result.get("confidence", 0.5) * GEMINI_WEIGHT)
+        sources.append("gemini")
+
     if not scores:
         return None
 
-    total_weight = (CLAUDE_WEIGHT if claude_result else 0) + (KIMI_WEIGHT if kimi_result else 0)
-    ensemble_score = sum(scores) / total_weight if total_weight > 0 else 0
-    ensemble_conf = sum(confs) / total_weight if total_weight > 0 else 0
+    actual_weight = 0.0
+    if "claude" in sources:
+        actual_weight += CLAUDE_WEIGHT
+    if "kimi" in sources:
+        actual_weight += KIMI_WEIGHT
+    if "gemini" in sources:
+        actual_weight += GEMINI_WEIGHT
+
+    ensemble_score = sum(scores) / actual_weight if actual_weight > 0 else 0
+    ensemble_conf = sum(confs) / actual_weight if actual_weight > 0 else 0
 
     return {
         "score": round(ensemble_score, 3),
@@ -251,7 +291,6 @@ def batch_sentiment(tickers: List[str], texts: Dict[str, List[str]] = None) -> D
     """
     Batch sentiment analysis for multiple tickers.
     Uses dual AI if enabled + keys available, falls back to keyword scoring.
-    Fires on every ticker (not just top liquid).
     """
     results = {}
     for ticker in tickers:
@@ -264,8 +303,8 @@ def batch_sentiment(tickers: List[str], texts: Dict[str, List[str]] = None) -> D
             )
             continue
 
-        # Try dual AI first (fires on every ticker)
-        ai_sentiment = _dual_ai_sentiment(ticker_texts) if DUAL_AI_ENABLED else None
+        # Try triple AI first
+        ai_sentiment = _triple_ai_sentiment(ticker_texts) if TRIPLE_AI_ENABLED else None
 
         # Keyword fallback (always computed)
         scores = []
@@ -325,8 +364,7 @@ def get_sentiment_for_ticker(ticker: str, headlines: List[str] = None) -> Sentim
 
 
 if __name__ == "__main__":
-    print("Sentiment Scraper v4.2.1 ready: Keyword + Dual AI (Claude + Kimi)")
-    print("Endpoints verified: Claude (api.anthropic.com) | Kimi (api.moonshot.cn)")
+    print("Sentiment Scraper v4.2.1 ready: Keyword + Triple AI (Claude + Kimi + Gemini)")
     demo = batch_sentiment(
         ["COMI", "FWRY"],
         {
