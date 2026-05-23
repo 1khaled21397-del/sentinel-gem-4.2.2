@@ -1,15 +1,16 @@
 """
-Sentinel-EGX v4.2.1-defensive — Defensive Patch
-=================================================
-Handles both old and new module versions gracefully.
-Adds: module verification, restart button, defensive sentiment access.
+Sentinel-EGX v4.2.1 — Fixed & Integrated Streamlit App
+========================================================
+FIXES: Double exchange suffix (data_engine), Clear Cache & Re-fetch button,
+       Kimi env var name fix (KIMI_API_KEY), Dual AI sentiment wiring,
+       Synthetic calendar (Sun-Thu), Debug logging.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import json, os, sqlite3, sys
+import json, os, sqlite3
 from pathlib import Path
 import tempfile
 import plotly.graph_objects as go
@@ -36,23 +37,22 @@ except FileNotFoundError:
     st.error("❌ sentinel_config.json not found. Please upload it.")
     st.stop()
 
-# ── API KEYS ──
+# ── API KEYS (Streamlit Secrets → .env → fallback) ──
 EODHD_API_KEY = ""
 ANTHROPIC_API_KEY = ""
 KIMI_API_KEY = ""
+GEMINI_API_KEY = ""
 
 try:
     EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", "").strip()
     ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "").strip()
-    KIMI_API_KEY = st.secrets.get("KIMI_API_KEY", "").strip()
-    if not KIMI_API_KEY and "sentinel" in st.secrets:
-        sentinel_cfg = st.secrets.get("sentinel", {})
-        if isinstance(sentinel_cfg, dict):
-            KIMI_API_KEY = sentinel_cfg.get("KIMI_API_KEY", "").strip()
+    KIMI_API_KEY = st.secrets.get("KIMI_API_KEY", "").strip()  # FIX v4.2.1: was "sentinel"
+    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "").strip()
 except Exception:
     pass
 
-if not all([EODHD_API_KEY, ANTHROPIC_API_KEY, KIMI_API_KEY]):
+# Fallback to env vars
+if not all([EODHD_API_KEY, ANTHROPIC_API_KEY, KIMI_API_KEY, GEMINI_API_KEY]):
     try:
         from dotenv import load_dotenv
         env_path = SCRIPT_DIR / ".env"
@@ -62,116 +62,97 @@ if not all([EODHD_API_KEY, ANTHROPIC_API_KEY, KIMI_API_KEY]):
             load_dotenv()
         EODHD_API_KEY = EODHD_API_KEY or os.getenv("EODHD_API_KEY", "").strip()
         ANTHROPIC_API_KEY = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY", "").strip()
-        KIMI_API_KEY = KIMI_API_KEY or os.getenv("KIMI_API_KEY", "").strip()
+        KIMI_API_KEY = KIMI_API_KEY or os.getenv("KIMI_API_KEY", "").strip()  # FIX v4.2.1
+        GEMINI_API_KEY = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "").strip()
     except ImportError:
         pass
 
+# Export keys to environment for child modules (data_engine, sentiment_scraper)
 os.environ["EODHD_API_KEY"] = EODHD_API_KEY
 os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 os.environ["KIMI_API_KEY"] = KIMI_API_KEY
+os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 
 # ── VALIDATE KEYS ──
 missing = []
 if not EODHD_API_KEY: missing.append("EODHD")
 if not ANTHROPIC_API_KEY: missing.append("Claude")
 if not KIMI_API_KEY: missing.append("Kimi")
+if not GEMINI_API_KEY: missing.append("Gemini")
 
 if missing:
     st.sidebar.error(f"🔴 Missing API keys: {', '.join(missing)}")
+    st.sidebar.markdown("Add keys in Streamlit Secrets or .env file")
 
 if not EODHD_API_KEY:
     st.error("❌ EODHD_API_KEY is required.")
     st.stop()
 
+# ── PAGE CONFIG ──
 st.set_page_config(page_title="Sentinel-EGX v4.2.1", layout="wide")
 
-# ── MODULE VERIFICATION ──
+# ── IMPORT v4.2.1 MODULES (with graceful fallback) ──
 MODULES_AVAILABLE = {}
-MODULE_VERSIONS = {}
 
 def _clean_val(v):
+    """Convert numpy types to native Python for clean display."""
     if hasattr(v, "item"):
         return v.item()
     if isinstance(v, (list, tuple)):
         return [_clean_val(x) for x in v]
     return v
 
-def verify_module(module_name, expected_attrs=None):
-    """Import module and verify it has expected attributes."""
-    try:
-        mod = __import__(module_name)
-        MODULES_AVAILABLE[module_name] = True
 
-        # Check version marker
-        ver = getattr(mod, '__version__', getattr(mod, 'VERSION', 'unknown'))
-        MODULE_VERSIONS[module_name] = ver
+try:
+    from data_engine import fetch_and_build, EGXCalendar, get_segment, DataCache
+    MODULES_AVAILABLE["data_engine"] = True
+except Exception as e:
+    MODULES_AVAILABLE["data_engine"] = False
+    st.sidebar.warning(f"data_engine not loaded: {e}")
 
-        # Check expected attributes
-        if expected_attrs:
-            missing_attrs = [a for a in expected_attrs if not hasattr(mod, a)]
-            if missing_attrs:
-                st.sidebar.warning(f"⚠️ {module_name} loaded but missing: {', '.join(missing_attrs)}")
-                return False
-        return True
-    except Exception as e:
-        MODULES_AVAILABLE[module_name] = False
-        st.sidebar.warning(f"🔴 {module_name} not loaded: {e}")
-        return False
-
-# Verify data_engine
-de_ok = verify_module("data_engine", ["fetch_and_build", "get_segment", "DataCache"])
-if de_ok:
-    from data_engine import fetch_and_build, get_segment, DataCache
-    # Verify URL fix is present
-    import data_engine as de_mod
-    if hasattr(de_mod, '_build_url'):
-        test_url = de_mod._build_url("COMI.EGX", "EGX", "d", 500)
-        if "COMI.EGX.EGX" in test_url:
-            st.sidebar.error("🔴 data_engine has DOUBLE SUFFIX BUG — replace file and restart!")
-        else:
-            st.sidebar.success("🟢 data_engine URL fix verified")
-
-# Verify other modules
-verify_module("technical_analysis", ["analyze_ticker", "get_indicator_summary"])
-if MODULES_AVAILABLE.get("technical_analysis"):
+try:
     from technical_analysis import analyze_ticker, get_indicator_summary
+    MODULES_AVAILABLE["technical_analysis"] = True
+except Exception as e:
+    MODULES_AVAILABLE["technical_analysis"] = False
+    st.sidebar.warning(f"technical_analysis not loaded: {e}")
 
-verify_module("auto_skills", ["analyze_skills"])
-if MODULES_AVAILABLE.get("auto_skills"):
+try:
     from auto_skills import analyze_skills
+    MODULES_AVAILABLE["auto_skills"] = True
+except Exception as e:
+    MODULES_AVAILABLE["auto_skills"] = False
+    st.sidebar.warning(f"auto_skills not loaded: {e}")
 
-verify_module("gap_predictor", ["predict_overnight_gap"])
-if MODULES_AVAILABLE.get("gap_predictor"):
+try:
     from gap_predictor import predict_overnight_gap
+    MODULES_AVAILABLE["gap_predictor"] = True
+except Exception as e:
+    MODULES_AVAILABLE["gap_predictor"] = False
+    st.sidebar.warning(f"gap_predictor not loaded: {e}")
 
-verify_module("ml_forecast", ["MLForecastEngine"])
-if MODULES_AVAILABLE.get("ml_forecast"):
+try:
     from ml_forecast import MLForecastEngine
+    MODULES_AVAILABLE["ml_forecast"] = True
+except Exception as e:
+    MODULES_AVAILABLE["ml_forecast"] = False
+    st.sidebar.warning(f"ml_forecast not loaded: {e}")
 
-# Verify sentiment_scraper with defensive handling
-sentiment_ok = verify_module("sentiment_scraper", ["get_sentiment_for_ticker"])
-if sentiment_ok:
-    from sentiment_scraper import get_sentiment_for_ticker
-    # Check if new version (has ai_source)
-    import sentiment_scraper as ss_mod
-    from dataclasses import fields
-    if hasattr(ss_mod, 'SentimentResult'):
-        sent_fields = [f.name for f in fields(ss_mod.SentimentResult)]
-        if 'ai_source' in sent_fields:
-            st.sidebar.success("🟢 sentiment_scraper v4.2.1+ verified")
-        else:
-            st.sidebar.warning("⚠️ sentiment_scraper is OLD version — replace file and restart!")
-            sentiment_ok = False
-    else:
-        sentiment_ok = False
+try:
+    from sentiment_scraper import batch_sentiment, get_sentiment_for_ticker
+    MODULES_AVAILABLE["sentiment"] = True
+except Exception as e:
+    MODULES_AVAILABLE["sentiment"] = False
+    st.sidebar.warning(f"sentiment_scraper not loaded: {e}")
 
-MODULES_AVAILABLE["sentiment"] = sentiment_ok
-
-verify_module("overnight_alpha", ["run_pipeline"])
-if MODULES_AVAILABLE.get("overnight_alpha"):
+try:
     from overnight_alpha import run_pipeline
+    MODULES_AVAILABLE["overnight_alpha"] = True
+except Exception as e:
+    MODULES_AVAILABLE["overnight_alpha"] = False
+    st.sidebar.warning(f"overnight_alpha not loaded: {e}")
 
-# ── CACHE ──
+# ── SQLITE CACHE ──
 def _get_db():
     conn = sqlite3.connect(str(CACHE_DB))
     conn.row_factory = sqlite3.Row
@@ -187,7 +168,8 @@ def init_cache():
     conn.commit()
     conn.close()
 
-def clear_eod_cache():
+def clear_cache():
+    """Clear all cached EOD data."""
     conn = _get_db()
     conn.execute("DELETE FROM eod_cache")
     conn.commit()
@@ -195,6 +177,7 @@ def clear_eod_cache():
     return True
 
 def get_cache_stats():
+    """Return cache statistics."""
     conn = _get_db()
     cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(fetched_at) as latest FROM eod_cache")
     row = cursor.fetchone()
@@ -223,6 +206,7 @@ if not ALL_TICKERS:
     st.error("❌ No tickers found in sentinel_config.json")
     st.stop()
 
+# Build reverse segment lookup
 TICKER_TO_SEGMENT = {}
 for seg, tickers in MARKET_SEGMENTS.items():
     for t in tickers:
@@ -242,6 +226,7 @@ with st.sidebar:
     st.write("🟢 EODHD" if EODHD_API_KEY else "🔴 EODHD")
     st.write("🟢 Claude" if ANTHROPIC_API_KEY else "🔴 Claude")
     st.write("🟢 Kimi" if KIMI_API_KEY else "🔴 Kimi")
+    st.write("🟢 Gemini" if GEMINI_API_KEY else "🔴 Gemini")
 
     st.subheader("📦 Modules")
     for mod, ok in MODULES_AVAILABLE.items():
@@ -250,13 +235,15 @@ with st.sidebar:
     st.subheader("📊 Settings")
     min_alpha = st.slider("Min Alpha Score", 0.0, 1.0, 0.55, 0.05)
     top_n = st.slider("Top N Setups", 1, 20, 10)
+
+    st.subheader("🔥 T+0 Filter")
     t0_only = st.checkbox("T+0 Eligible Only", value=False)
 
     st.divider()
-    st.caption(f"📈 {len(ALL_TICKERS)} tickers")
+    st.caption(f"📈 {len(ALL_TICKERS)} tickers configured")
     st.caption(f"⏰ Cache TTL: {config.get('rules', {}).get('cache_ttl_hours', 6)}h")
 
-# ── TABS ──
+# ── MAIN TABS ──
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 Overnight Alpha", "🔬 Single Stock", "📊 Scanner", "🗂️ Watchlists", "⚙️ Diagnostics"
 ])
@@ -264,10 +251,13 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ── TAB 1: OVERNIGHT ALPHA ──
 with tab1:
     st.header("🚀 Overnight Alpha Pipeline")
+    st.caption("Full v4.2.1 pipeline: Data → Sentiment → Gap → ML → Skills → Technical → Alpha")
+
     col1, col2 = st.columns([3, 1])
     with col1:
         selected_tickers = st.multiselect(
-            "Select Tickers", options=ALL_TICKERS,
+            "Select Tickers to Analyze",
+            options=ALL_TICKERS,
             default=ALL_TICKERS[:20] if len(ALL_TICKERS) > 20 else ALL_TICKERS,
             key="alpha_tickers"
         )
@@ -279,10 +269,12 @@ with tab1:
     if run_alpha and selected_tickers:
         progress = st.progress(0)
         status = st.empty()
+
         results = []
         for i, ticker in enumerate(selected_tickers):
             progress.progress((i + 1) / len(selected_tickers))
             status.text(f"Analyzing {ticker}... ({i+1}/{len(selected_tickers)})")
+
             try:
                 if MODULES_AVAILABLE.get("overnight_alpha"):
                     from overnight_alpha import OvernightAlphaPipeline
@@ -290,12 +282,20 @@ with tab1:
                     res = pipeline.run_ticker(ticker)
                     if res and res.alpha >= min_alpha:
                         results.append({
-                            "ticker": res.ticker, "alpha": res.alpha,
-                            "t0_eligible": res.t0_eligible, "setup": res.setup,
-                            "gap": res.gap, "technical": res.technical,
+                            "ticker": res.ticker,
+                            "alpha": res.alpha,
+                            "t0_eligible": res.t0_eligible,
+                            "setup": res.setup,
+                            "gap": res.gap,
+                            "technical": res.technical,
                         })
+                else:
+                    st.warning("overnight_alpha module not available — using basic mode")
+                    break
             except Exception as e:
                 st.error(f"Error analyzing {ticker}: {e}")
+                continue
+
         progress.empty()
         status.empty()
 
@@ -305,7 +305,8 @@ with tab1:
         results = results[:top_n]
 
         if results:
-            st.success(f"Found {len(results)} setups")
+            st.success(f"Found {len(results)} setups above {min_alpha} alpha threshold")
+
             for i, r in enumerate(results, 1):
                 with st.expander(f"#{i} {r['ticker']} | Alpha: {r['alpha']:.2f} | {r['setup']['type']}", expanded=(i==1)):
                     c1, c2, c3, c4 = st.columns(4)
@@ -313,18 +314,36 @@ with tab1:
                     c2.metric("T+0", "✅ Yes" if r['t0_eligible'] else "⏳ T+1")
                     c3.metric("Gap", f"{r['gap']['direction']} {r['gap']['probability']:.0%}")
                     c4.metric("R/R", f"{r['setup']['rr']:.1f}:1")
+
+                    # Flow Sentiment
+                    if 'flow_sentiment' in r and r['flow_sentiment']:
+                        flow = r['flow_sentiment']
+                        flow_score = flow.get('score', 0)
+                        flow_conf = flow.get('confidence', 0)
+                        if flow_conf > 0.2:
+                            st.markdown("**🌊 EGX Flow Sentiment:**")
+                            fc1, fc2, fc3 = st.columns(3)
+                            fc1.metric("Flow Score", f"{flow_score:+.2f}")
+                            fc2.metric("Foreign Ratio", f"{flow.get('meta', {}).get('foreign_ratio', 0):.1%}")
+                            fc3.metric("Confidence", f"{flow_conf:.0%}")
+
                     st.markdown("**Setup Rationale:**")
                     for note in r['setup']['rationale']:
                         st.write(f"  {note}")
+
+                    st.markdown(f"**Entry:** {r['setup']['entry']} | **Stop:** {r['setup']['stop']} | **Target:** {r['setup']['targets']}")
+                    st.markdown(f"**Best Session:** {r['setup']['best_session']} | **Gemini Score:** {r['technical']['gemini_framework']['composite']:.2f}")
         else:
-            st.info("No setups above threshold.")
+            st.info("No setups above threshold. Try lowering min alpha or selecting more tickers.")
 
 # ── TAB 2: SINGLE STOCK ──
 with tab2:
     st.header("🔬 Single Stock Deep Analysis")
+
     ticker = st.selectbox("Select Ticker", ALL_TICKERS, key="single_ticker")
     segment = get_ticker_segment(ticker)
     t0 = is_t0_eligible(ticker)
+
     st.caption(f"Segment: {segment} | T+0: {'✅ Eligible' if t0 else '⏳ T+1 Only'}")
 
     if st.button("Analyze", type="primary"):
@@ -334,24 +353,15 @@ with tab2:
                     df = fetch_and_build(ticker, "EGX", lookback=400, use_cache=True)
                     is_synthetic = df.attrs.get("synthetic", False)
                     if is_synthetic:
-                        st.warning(f"⚠️ Using synthetic data for {ticker} (EODHD unavailable or API quota exceeded).")
-                        st.info("""
-                        **Most likely cause:** EODHD API quota exhausted
-
-                        Your plan: 20 calls/day (free tier) | Configured for: 5,000 calls/day
-
-                        **Solutions:**
-                        1. Wait for daily reset (midnight UTC)
-                        2. Upgrade to $19.99/mo plan at eodhd.com
-                        3. Check EODHD dashboard for quota status
-                        """)
+                        st.warning(f"⚠️ Using synthetic data for {ticker} (EODHD unavailable)")
                     else:
-                        st.success(f"Loaded {len(df)} real EODHD bars for {ticker}")
+                        st.success(f"Loaded {len(df)} bars for {ticker}")
 
-                    # Technical
+                    # Technical Analysis
                     if MODULES_AVAILABLE.get("technical_analysis"):
                         snap, setup = analyze_ticker(df, ticker, segment)
                         summary = get_indicator_summary(snap)
+
                         st.subheader("📊 Technical Snapshot")
                         c1, c2, c3, c4 = st.columns(4)
                         c1.metric("Trend", snap.trend_direction)
@@ -370,6 +380,7 @@ with tab2:
                         st.subheader("📈 Setup Quality")
                         st.write(f"Type: **{setup.setup_type}** | Score: {_clean_val(setup.quality_score)}")
                         st.write(f"Entry: {_clean_val(setup.entry_zone)} | Stop: {_clean_val(setup.stop_loss)} | Targets: {_clean_val(setup.targets)}")
+                        st.write(f"Best Session: {setup.best_session}")
 
                         st.subheader("📝 Rationale")
                         for note in setup.rationale:
@@ -383,7 +394,7 @@ with tab2:
                         for detail in skills.get("triggered_details", []):
                             st.write(f"  {detail['skill']}: {detail['direction']} ({detail['confidence']:.0%}) — Gemini aligned: {detail['gemini_aligned']}")
 
-                    # Gap
+                    # Gap Predictor
                     if MODULES_AVAILABLE.get("gap_predictor"):
                         gap = predict_overnight_gap(df, ticker, segment)
                         st.subheader("🌙 Gap Prediction")
@@ -391,41 +402,39 @@ with tab2:
                         st.write(f"Expected Magnitude: {gap.expected_magnitude:.2%}")
                         st.write(f"T+0 Boost: {gap.t0_liquidity_boost:.1f}x")
 
-                    # ML
+                    # ML Forecast
                     if MODULES_AVAILABLE.get("ml_forecast"):
                         ml = MLForecastEngine()
                         ml.train(df)
                         ml_pred = ml.predict(df)
                         if ml_pred:
                             st.subheader("🧬 ML Forecast (7d)")
-                            st.write(f"Target Return: {ml_pred.get('target_return', 0):+.2%}")
+                            target_return = ml_pred.get('target_return', 0)
+                            st.write(f"Target Return: {target_return:+.2%}")
                             st.write(f"Confidence: {ml_pred.get('confidence', 0):.0%}")
+                            st.write(f"XGB: {ml_pred.get('xgb_pred', 0):+.2%} | RF: {ml_pred.get('rf_pred', 0):+.2%}")
 
-                    # Sentiment — DEFENSIVE: handles old and new sentiment_scraper
-                    st.subheader("📰 Sentiment Analysis")
-                    demo_headlines = [
-                        f"{ticker.split('.')[0]} reports strong quarterly earnings",
-                        f"Foreign investors increase holdings in {ticker.split('.')[0]}",
-                        f"{ticker.split('.')[0]} announces expansion into new markets"
-                    ]
-                    try:
-                        if sentiment_ok:
+                    # Sentiment (Triple AI)
+                    if MODULES_AVAILABLE.get("sentiment"):
+                        st.subheader("📰 Sentiment Analysis")
+                        # Try to get real headlines from a news source, or use placeholder
+                        # In production, you'd integrate with a news API
+                        demo_headlines = [
+                            f"{ticker.split('.')[0]} reports strong quarterly earnings",
+                            f"Foreign investors increase holdings in {ticker.split('.')[0]}",
+                            f"{ticker.split('.')[0]} announces expansion into new markets"
+                        ]
+                        try:
                             sent = get_sentiment_for_ticker(ticker, demo_headlines)
                             sc1, sc2, sc3 = st.columns(3)
                             sc1.metric("Score", f"{sent.score:+.2f}")
                             sc2.metric("Confidence", f"{sent.confidence:.0%}")
-                            # DEFENSIVE: check if ai_source exists (handles old module)
-                            ai_src = getattr(sent, 'ai_source', None)
-                            sc3.metric("AI Source", ai_src or "Keyword")
+                            sc3.metric("AI Source", sent.ai_source or "Keyword")
                             st.write(f"Summary: {sent.summary}")
-                            ai_score = getattr(sent, 'ai_score', None)
-                            ai_conf = getattr(sent, 'ai_confidence', None)
-                            if ai_score is not None:
-                                st.caption(f"AI Score: {ai_score:+.2f} (conf: {ai_conf:.0%})")
-                        else:
-                            st.info("Sentiment module unavailable or outdated. Replace sentiment_scraper.py and restart.")
-                    except Exception as e:
-                        st.warning(f"Sentiment analysis failed: {e}")
+                            if sent.ai_score is not None:
+                                st.caption(f"AI Score: {sent.ai_score:+.2f} (conf: {sent.ai_confidence:.0%})")
+                        except Exception as e:
+                            st.warning(f"Sentiment analysis failed: {e}")
 
                     # Chart
                     st.subheader("📈 Price Chart")
@@ -443,16 +452,41 @@ with tab2:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.error("data_engine module not available")
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
+            except ValueError as e:
+                error_msg = str(e)
+                if "Insufficient data" in error_msg or "0 bars" in error_msg:
+                    st.error(f"📊 {error_msg}")
+                    st.info("""
+                    **Possible causes:**
+                    • Ticker is newly listed (< 50 trading days)
+                    • Ticker was delisted or suspended
+                    • EODHD API key invalid or quota exceeded
+                    • EODHD does not cover this ticker
+
+                    **Try:** Select a different ticker (e.g., COMI.EGX, HRHO.EGX, FWRY.EGX)
+                    """)
+                elif "Unable to fetch" in error_msg:
+                    st.error(f"🔌 {error_msg}")
+                    st.info("Check your EODHD_API_KEY in .env or Streamlit Secrets")
+                else:
+                    st.error(f"Analysis failed: {e}")
+
                 with st.expander("🔧 Debug Details"):
                     import traceback
                     st.code(traceback.format_exc())
 
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
 # ── TAB 3: SCANNER ──
 with tab3:
     st.header("📊 Market Scanner")
+    st.info("Batch scan across selected universe. Uses v4.2.1 Alpha scorer with all layers.")
+
     scan_universe = st.multiselect("Select Universe", ALL_TICKERS, default=ALL_TICKERS[:30], key="scan_universe")
+
     if st.button("🔍 Run Scanner", type="primary"):
         if MODULES_AVAILABLE.get("overnight_alpha"):
             with st.spinner("Scanning..."):
@@ -460,24 +494,32 @@ with tab3:
                     results = run_pipeline(scan_universe)
                     if results:
                         st.success(f"Found {len(results)} setups")
-                        df_results = pd.DataFrame([{
-                            "Ticker": r["ticker"], "Alpha": r["alpha"],
-                            "T0": "✅" if r["t0_eligible"] else "⏳",
-                            "Setup": r["setup"]["type"], "Gap": r["gap"]["direction"],
-                            "R/R": r["setup"]["rr"], "Session": r["setup"]["best_session"],
-                        } for r in results[:top_n]])
+                        df_results = pd.DataFrame([
+                            {
+                                "Ticker": r["ticker"],
+                                "Alpha": r["alpha"],
+                                "T0": "✅" if r["t0_eligible"] else "⏳",
+                                "Setup": r["setup"]["type"],
+                                "Gap": r["gap"]["direction"],
+                                "R/R": r["setup"]["rr"],
+                                "Session": r["setup"]["best_session"],
+                                "Flow": r.get("flow_sentiment", {}).get("score", 0),
+                            }
+                            for r in results[:top_n]
+                        ])
                         st.dataframe(df_results, use_container_width=True, hide_index=True)
                     else:
                         st.info("No setups found.")
                 except Exception as e:
                     st.error(f"Scanner failed: {e}")
         else:
-            st.error("overnight_alpha module required")
+            st.error("overnight_alpha module required for scanner")
 
 # ── TAB 4: WATCHLISTS ──
 with tab4:
     st.header("🗂️ My Watchlists")
     watchlists = load_watchlists()
+
     col_a, col_b = st.columns([1, 2])
     with col_a:
         new_name = st.text_input("New Watchlist Name")
@@ -486,12 +528,15 @@ with tab4:
                 watchlists[new_name] = []
                 save_watchlists(watchlists)
                 st.rerun()
+
         wl_names = list(watchlists.keys())
         selected_wl = st.selectbox("Select", wl_names if wl_names else ["(none)"])
+
         if selected_wl in watchlists and st.button("🗑️ Delete"):
             del watchlists[selected_wl]
             save_watchlists(watchlists)
             st.rerun()
+
     with col_b:
         if selected_wl in watchlists:
             st.subheader(f"📌 {selected_wl} ({len(watchlists[selected_wl])} tickers)")
@@ -500,6 +545,7 @@ with tab4:
                 watchlists[selected_wl].append(add_ticker)
                 save_watchlists(watchlists)
                 st.rerun()
+
             for t in list(watchlists[selected_wl]):
                 c1, c2 = st.columns([5, 1])
                 c1.write(f"`{t}` ({get_ticker_segment(t)})")
@@ -514,8 +560,7 @@ with tab5:
 
     st.subheader("Module Status")
     for mod, ok in MODULES_AVAILABLE.items():
-        ver = MODULE_VERSIONS.get(mod, '?')
-        st.write(f"{'🟢' if ok else '🔴'} {mod} (ver: {ver})")
+        st.write(f"{'🟢' if ok else '🔴'} {mod}")
 
     st.subheader("Config Preview")
     with st.expander("View sentinel_config.json"):
@@ -530,33 +575,24 @@ with tab5:
     except Exception as e:
         st.write(f"Cache error: {e}")
 
-    # Cache Management
+    # NEW v4.2.1: Clear Cache & Re-fetch
     st.subheader("🧹 Cache Management")
+    st.caption("Clear cached data to force fresh EODHD fetches. Useful after fixing API keys or when data seems stale.")
+
     col_cache1, col_cache2 = st.columns([1, 3])
     with col_cache1:
-        if st.button("🗑️ Clear EOD Cache", type="secondary"):
+        if st.button("🗑️ Clear Cache", type="secondary"):
             try:
-                clear_eod_cache()
-                st.success("✅ EOD cache cleared! Next analysis will fetch fresh EODHD data.")
+                clear_cache()
+                st.success("✅ Cache cleared successfully! Next analysis will fetch fresh data from EODHD.")
                 st.balloons()
             except Exception as e:
-                st.error(f"Failed: {e}")
+                st.error(f"Failed to clear cache: {e}")
+
     with col_cache2:
         st.write("")
         st.write("")
-        st.info("💡 Clear cache to force fresh EODHD fetches after fixing API keys.")
-
-    # NEW: Restart Server
-    st.subheader("🔄 Server Management")
-    st.caption("Python caches imported modules in memory. After replacing .py files, you MUST restart the server.")
-    if st.button("🔄 Restart Streamlit Server", type="primary"):
-        st.warning("Restarting server... Please wait 10-20 seconds and refresh the page.")
-        # Trigger Streamlit's auto-reload by touching this file
-        Path(__file__).touch()
-        # Alternative: use os._exit to force restart
-        import time
-        time.sleep(1)
-        os._exit(0)  # Force process restart
+        st.info("💡 After clearing cache, re-run any analysis to fetch fresh EODHD data.")
 
     st.subheader("T+0 Segment Map")
     seg_df = pd.DataFrame([
@@ -565,5 +601,60 @@ with tab5:
     ])
     st.dataframe(seg_df, hide_index=True)
 
+    st.subheader("🧠 Gap Model Training")
+    st.caption("Train the overnight gap predictor on historical EOD data. Required before ML gap predictions.")
+
+    col_train1, col_train2 = st.columns([1, 3])
+    with col_train1:
+        train_tickers = st.multiselect(
+            "Tickers to train on",
+            options=ALL_TICKERS,
+            default=ALL_TICKERS[:10] if len(ALL_TICKERS) > 10 else ALL_TICKERS,
+            key="train_tickers"
+        )
+    with col_train2:
+        st.write("")
+        st.write("")
+        run_training = st.button("🏋️ Train Gap Model", type="primary", disabled=not MODULES_AVAILABLE.get("gap_predictor"))
+
+    if run_training and train_tickers:
+        from gap_predictor import train_gap_model
+        train_progress = st.progress(0)
+        train_status = st.empty()
+
+        historical_data = {}
+        segments = {}
+        total = len(train_tickers)
+
+        for idx, ticker in enumerate(train_tickers):
+            train_status.text(f"Fetching {ticker}... ({idx+1}/{total})")
+            try:
+                df = fetch_and_build(ticker, "EGX", lookback=400, use_cache=True)
+                historical_data[ticker] = df
+                segments[ticker] = get_segment(ticker)
+            except Exception as e:
+                st.warning(f"Skipping {ticker}: {e}")
+            train_progress.progress((idx + 1) / total)
+
+        if len(historical_data) >= 3:
+            train_status.text("Training model...")
+            try:
+                predictor, metrics = train_gap_model(historical_data, segments)
+                predictor.save("gap_model_v42.pkl")
+                train_progress.empty()
+                train_status.empty()
+                st.success(f"✅ Model trained on {len(historical_data)} tickers | Accuracy: {metrics.get('accuracy', 'N/A')}")
+                st.json(metrics)
+                st.info("🔄 Refresh the app to use the trained model for gap predictions.")
+            except Exception as e:
+                train_progress.empty()
+                train_status.empty()
+                st.error(f"Training failed: {e}")
+        else:
+            train_progress.empty()
+            train_status.empty()
+            st.error("Need at least 3 tickers with valid data to train.")
+
+# ── FOOTER ──
 st.divider()
 st.caption("Sentinel-EGX v4.2.1 | Overnight Alpha + Gemini Flash + T+0/T+1 Aware | EOD Data Only")
