@@ -1,0 +1,108 @@
+name: Sentinel-EGX v4.2.1 Pre-Market Pipeline
+
+on:
+  schedule:
+    # EGX trades Sun(0)-Thu(4). Run at 06:30 Cairo time (UTC+2) = 04:30 UTC
+    - cron: '30 4 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Comma-separated tickers to process (or "all")'
+        required: false
+        default: 'all'
+      skip_telegram:
+        description: 'Skip Telegram notification'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: '3.11'
+  TZ: Africa/Cairo
+
+jobs:
+  premarket-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache EOD data
+        uses: actions/cache@v4
+        with:
+          path: ./sentinel_cache.db
+          key: eod-cache-${{ github.run_id }}
+          restore-keys: |
+            eod-cache-
+
+      - name: Verify module imports
+        run: |
+          python -c "import data_engine; print('data_engine OK')"
+          python -c "import technical_analysis; print('technical_analysis OK')"
+          python -c "import sentiment_scraper; print('sentiment_scraper OK')"
+          python -c "import ml_forecast; print('ml_forecast OK')"
+          python -c "import overnight_alpha; print('overnight_alpha OK')"
+
+      - name: Run v4.2.1 Pipeline
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          python -c "
+          import json, os
+          from overnight_alpha import run_pipeline
+          tickers_input = os.getenv('INPUT_TICKERS', 'all')
+          if tickers_input == 'all':
+              result = run_pipeline()
+          else:
+              tickers = [t.strip() for t in tickers_input.split(',')]
+              result = run_pipeline(tickers)
+          with open('digest.json', 'w') as f:
+              json.dump(result, f, indent=2, default=str)
+          print('Pipeline complete. Setups:', len(result))
+          "
+
+      - name: Send Telegram Digest
+        if: ${{ github.event.inputs.skip_telegram != 'true' && secrets.TELEGRAM_BOT_TOKEN != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import os, json, requests
+          with open('digest.json') as f:
+              d = json.load(f)
+          setups = len(d) if isinstance(d, list) else 0
+          msg = f'🛡️ *Sentinel-EGX v4.2.1* — {setups} setups found'
+          url = f'https://api.telegram.org/bot{os.getenv("TELEGRAM_BOT_TOKEN")}/sendMessage'
+          payload = {'chat_id': os.getenv('TELEGRAM_CHAT_ID'), 'text': msg, 'parse_mode': 'Markdown'}
+          r = requests.post(url, json=payload, timeout=30)
+          print('Telegram status:', r.status_code)
+          "
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-digest
+          path: digest.json
+          retention-days: 7
