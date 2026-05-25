@@ -1,5 +1,5 @@
 """
-Sentinel-EGX v4.2 — ML Forecast Engine
+Sentinel-EGX v4.2.2 — ML Forecast Engine
 ========================================
 7-day return forecast using XGBoost + Random Forest ensemble.
 Aligned with sentinel_config.json v4.2 ml_forecast specs.

@@ -1,5 +1,5 @@
 """
-Sentinel-EGX v4.2 — Hedge Engine
+Sentinel-EGX v4.2.2 — Hedge Engine
 EGX30 futures beta-adjusted hedge calculator
 """
 import json
@@ -11,7 +11,7 @@ class EGXHedgeEngine:
     """Calculate beta-adjusted hedge ratio for EGX30 futures."""
 
     def __init__(self, config_path: str = "sentinel_config.json"):
-        with open(config_path) as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         self.cfg = cfg["hedge_engine"]
         self.futures_beta = self.cfg.get("egx30_futures_beta", 0.85)

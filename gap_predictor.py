@@ -1,5 +1,5 @@
 """
-Sentinel-EGX v4.2 — Gap Predictor Engine
+Sentinel-EGX v4.2.2 — Gap Predictor Engine
 =========================================
 Overnight gap prediction using 35 features + XGBoost/Random Forest.
 Aligned with sentinel_config.json v4.2 gap_predictor specs.
@@ -209,8 +209,12 @@ class GapPredictor:
         prob = self.model.predict_proba(latest)[0][1]  # probability of gap > threshold
         pred_class = self.model.predict(latest)[0]
 
-        direction = "up" if pred_class == 1 and df["close"].pct_change(1).iloc[-1] > 0 else \
-                    "down" if pred_class == 1 else "neutral"
+        if pred_class == 1 and df["close"].pct_change(1).iloc[-1] > 0:
+            direction = "up"
+        elif pred_class == 1:
+            direction = "down"
+        else:
+            direction = "neutral"
 
         magnitude = self.threshold * (1 + prob)
 

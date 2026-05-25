@@ -1,5 +1,5 @@
 """
-Sentinel-EGX v4.2.1 — Auto Skills Engine
+Sentinel-EGX v4.2.2 — Auto Skills Engine
 ==========================================
 7 pattern recognition skills for alpha scoring.
 Breakout, Mean Reversion, Trend Following, Volume Spike,

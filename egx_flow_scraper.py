@@ -1,5 +1,5 @@
 """
-Sentinel-EGX v4.2 — EGX Flow Sentiment Scraper
+Sentinel-EGX v4.2.2 — EGX Flow Sentiment Scraper
 ===============================================
 Scrapes EGX market flow data (foreign/institutional/retail ratios).
 Aligned with sentinel_config.json v4.2 flow_sentiment specs.

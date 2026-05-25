@@ -14,7 +14,7 @@ class BacktestEngine:
     """Walk-forward backtest for overnight gap and ML forecast strategies."""
 
     def __init__(self, config_path: str = "sentinel_config.json"):
-        with open(config_path) as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         self.cfg = cfg["backtest"]
         self.alpha_cfg = cfg.get("alpha_scorer", {})
