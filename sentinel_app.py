@@ -154,7 +154,7 @@ except Exception as e:
 
 # NEW v4.2.2: Hybrid Regime Detector
 try:
-    from regime_detector_v2 import HybridRegimeEnsemble, HeuristicRegimeDetector, MacroRegimeAnalyzer
+    from regime_detector import HybridRegimeEnsemble, HeuristicRegimeDetector, MacroRegimeAnalyzer
     MODULES_AVAILABLE["regime_detector_v2"] = True
 except Exception as e:
     MODULES_AVAILABLE["regime_detector_v2"] = False
@@ -658,7 +658,7 @@ with tab5:
             if run_regime:
                 with st.spinner(f"Analyzing regime for {regime_ticker}..."):
                     try:
-                        from regime_detector_v2 import HybridRegimeEnsemble
+                        from regime_detector import HybridRegimeEnsemble
                         ensemble = HybridRegimeEnsemble()
 
                         df_reg = fetch_and_build(regime_ticker, "EGX", lookback=100, use_cache=True)
