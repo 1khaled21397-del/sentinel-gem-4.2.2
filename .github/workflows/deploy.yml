@@ -46,13 +46,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Cache EOD data
+      - name: Cache EOD data (DeltaCache)
         uses: actions/cache@v4
         with:
-          path: ./sentinel_cache.db
-          key: eod-cache-${{ github.run_id }}
+          path: ./sentinel_delta_cache.db
+          key: delta-cache-${{ github.run_id }}
           restore-keys: |
-            eod-cache-
+            delta-cache-
 
       - name: Verify module imports
         run: |
@@ -61,12 +61,14 @@ jobs:
           python -c "import sentiment_scraper; print('sentiment_scraper OK')"
           python -c "import ml_forecast; print('ml_forecast OK')"
           python -c "import overnight_alpha; print('overnight_alpha OK')"
+          python -c "import delta_cache; print('delta_cache OK')"
 
-      - name: Run v4.2.1 Pipeline
+      - name: Run v4.2.2 Pipeline
         env:
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python -c "
           import json, os
@@ -93,7 +95,7 @@ jobs:
           with open('digest.json') as f:
               d = json.load(f)
           setups = len(d) if isinstance(d, list) else 0
-          msg = f'🛡️ *Sentinel-EGX v4.2.1* — {setups} setups found'
+          msg = f'🛡️ *Sentinel-EGX v4.2.2* — {setups} setups found\n📅 {datetime.now().strftime("%Y-%m-%d %H:%M")}'
           url = f'https://api.telegram.org/bot{os.getenv("TELEGRAM_BOT_TOKEN")}/sendMessage'
           payload = {'chat_id': os.getenv('TELEGRAM_CHAT_ID'), 'text': msg, 'parse_mode': 'Markdown'}
           r = requests.post(url, json=payload, timeout=30)
