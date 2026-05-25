@@ -1,8 +1,8 @@
 """
-Sentinel-EGX v4.2 — Overnight Alpha Pipeline
-===============================================
-Full integration: Data → Sentiment → Gap → ML → Skills → Technical → Alpha
-Now with EGX.com institutional flow sentiment (NEW v4.2.1)
+Sentinel-EGX v4.2.2 — Overnight Alpha Pipeline
+================================================
+Full integration: Data → Sentiment → Gap → ML → Skills → Technical → Alpha → Regime
+NEW v4.2.2: Hybrid Regime Detector (heuristic + Claude macro + disagreement handling)
 """
 
 import json
@@ -30,15 +30,17 @@ class AlphaResult:
     gap: Dict
     ml: Dict
     sentiment: Dict
-    flow_sentiment: Dict  # NEW
+    flow_sentiment: Dict
     skills: Dict
     technical: Dict
     setup: Dict
     regime: str
+    # NEW v4.2.2: Hybrid regime fields
+    hybrid_regime: Dict = field(default_factory=dict)
 
 
 class OvernightAlphaPipeline:
-    """End-to-end overnight alpha scoring pipeline with flow sentiment."""
+    """End-to-end overnight alpha scoring pipeline with flow sentiment + hybrid regime."""
 
     def __init__(self, tickers: List[str], config_path: str = "sentinel_config.json"):
         self.tickers = tickers
@@ -47,6 +49,20 @@ class OvernightAlphaPipeline:
 
         # Pre-fetch market-wide flow sentiment (cached for all tickers)
         self.market_flow = self._fetch_market_flow()
+
+        # NEW v4.2.2: Initialize hybrid regime ensemble
+        try:
+            from regime_detector_v2 import HybridRegimeEnsemble
+            self.ensemble = HybridRegimeEnsemble()
+            self.hybrid_regime_available = True
+        except ImportError as e:
+            print(f"[OvernightAlpha] regime_detector_v2 not available: {e}")
+            self.ensemble = None
+            self.hybrid_regime_available = False
+
+        # NEW v4.2.2: Cache macro analysis across tickers (one Claude call/day)
+        self._cached_macro = None
+        self._cached_headlines = None
 
     def _fetch_market_flow(self) -> Dict:
         """Fetch EGX.com flow sentiment once per pipeline run."""
@@ -62,7 +78,31 @@ class OvernightAlphaPipeline:
                 return {"score": 0, "confidence": 0, "note": f"Flow fetch failed: {e}, using neutral"}
             return {"score": 0, "confidence": 0, "note": f"Flow fetch failed: {e}"}
 
-    def run_ticker(self, ticker: str) -> Optional[AlphaResult]:
+    # NEW v4.2.2: Cache macro analysis across all tickers
+    def _get_macro(self, headlines: List[str] = None) -> Optional[Dict]:
+        """Cache macro analysis across all tickers (one Claude call per pipeline run)."""
+        if not self.hybrid_regime_available or self.ensemble is None:
+            return None
+
+        # Use cached macro if headlines haven't changed
+        if self._cached_macro is not None and headlines == self._cached_headlines:
+            return self._cached_macro
+
+        self._cached_headlines = headlines
+        macro_result = self.ensemble.macro.analyze(headlines)
+        self._cached_macro = {
+            "macro_score": macro_result.macro_score,
+            "confidence": macro_result.confidence,
+            "risk_off": macro_result.risk_off_flag,
+            "risk_on": macro_result.risk_on_flag,
+            "sector_rotation": macro_result.sector_rotation,
+            "key_factors": macro_result.key_factors,
+            "summary": macro_result.summary,
+            "source": macro_result.source
+        }
+        return self._cached_macro
+
+    def run_ticker(self, ticker: str, headlines: List[str] = None) -> Optional[AlphaResult]:
         """Run full pipeline for a single ticker."""
         try:
             from data_engine import fetch_and_build, get_segment
@@ -71,7 +111,7 @@ class OvernightAlphaPipeline:
             from gap_predictor import predict_overnight_gap
             from ml_forecast import MLForecastEngine
             from sentiment_scraper import get_sentiment_for_ticker
-            from regime_detector import detect_regime
+            from regime_detector import detect_regime  # Legacy fallback
         except ImportError as e:
             print(f"[OvernightAlpha] Import error: {e}")
             return None
@@ -137,19 +177,85 @@ class OvernightAlphaPipeline:
         except Exception:
             sent_dict = {"score": 0, "confidence": 0, "summary": "No data"}
 
-        # 7. EGX Flow Sentiment (NEW — market-wide, same for all tickers)
+        # 7. EGX Flow Sentiment (market-wide, same for all tickers)
         flow_dict = self.market_flow.copy()
         flow_score = flow_dict.get("score", 0)
         flow_conf = flow_dict.get("confidence", 0)
 
-        # 8. Regime
-        try:
-            regime = detect_regime(df)
-            regime_str = regime.get("regime", "unknown")
-            position_mult = regime.get("position_size", 1.0)
-        except Exception:
-            regime_str = "unknown"
-            position_mult = 1.0
+        # ═══════════════════════════════════════════════════════════════════════
+        # 8. Regime — NEW v4.2.2: Hybrid (heuristic + Claude macro)
+        # ═══════════════════════════════════════════════════════════════════════
+        regime_str = "unknown"
+        position_mult = 1.0
+        hybrid_regime_dict = {}
+
+        if self.hybrid_regime_available and self.ensemble is not None:
+            try:
+                # Fetch cached macro (one call across all tickers)
+                macro_cached = self._get_macro(headlines)
+
+                # Run full hybrid detection
+                hybrid = self.ensemble.detect(
+                    df,
+                    ticker=ticker,
+                    segment=segment,
+                    headlines=headlines  # triggers cache hit after first ticker
+                )
+
+                regime_str = hybrid.regime
+                position_mult = hybrid.position_size
+
+                # Build serializable hybrid regime dict
+                hybrid_regime_dict = {
+                    "regime": hybrid.regime,
+                    "position_size": hybrid.position_size,
+                    "confidence": hybrid.confidence,
+                    "heuristic_regime": hybrid.heuristic.regime,
+                    "macro_score": hybrid.macro.macro_score,
+                    "macro_source": hybrid.macro.source,
+                    "disagreement_index": hybrid.disagreement_index,
+                    "conflict_flag": hybrid.conflict_flag,
+                    "recommendation": hybrid.recommendation,
+                    "shock_detected": hybrid.heuristic.shock_detected,
+                    "shock_type": hybrid.heuristic.shock_type,
+                    "t0_spike": hybrid.heuristic.t0_volatility_spike,
+                    "timestamp": hybrid.timestamp
+                }
+
+                # Log for paper trading review
+                print(f"[{ticker}] Regime: {regime_str} | "
+                      f"H:{hybrid.heuristic.regime} M:{hybrid.macro.macro_score:+.2f} | "
+                      f"Disagree: {hybrid.disagreement_index} | "
+                      f"Rec: {hybrid.recommendation}")
+
+                # If conflict flag, reduce position size further
+                if hybrid.conflict_flag:
+                    position_mult *= 0.5
+                    print(f"[{ticker}] ⚠️ CONFLICT detected — position size reduced to {position_mult:.0%}")
+
+                # If shock detected, log warning
+                if hybrid.heuristic.shock_detected:
+                    print(f"[{ticker}] 🚨 SHOCK: {hybrid.heuristic.shock_type} — defensive posture")
+
+            except Exception as e:
+                print(f"[OvernightAlpha] Hybrid regime failed for {ticker}: {e}")
+                # Fallback to legacy regime detector
+                try:
+                    regime = detect_regime(df)
+                    regime_str = regime.get("regime", "unknown")
+                    position_mult = regime.get("position_size", 1.0)
+                except Exception:
+                    regime_str = "unknown"
+                    position_mult = 1.0
+        else:
+            # Fallback to legacy regime detector
+            try:
+                regime = detect_regime(df)
+                regime_str = regime.get("regime", "unknown")
+                position_mult = regime.get("position_size", 1.0)
+            except Exception:
+                regime_str = "unknown"
+                position_mult = 1.0
 
         # 9. Alpha Score (with flow sentiment)
         gap_score = gap_dict["magnitude"] * gap_dict["probability"]
@@ -175,7 +281,7 @@ class OvernightAlphaPipeline:
             WEIGHTS.get("technical", 0.1) * tech_score +
             WEIGHTS.get("weekly_confluence", 0.1) * weekly_score +
             WEIGHTS.get("sr_bonus", 0.05) * sr_bonus +
-            WEIGHTS.get("flow_sentiment", 0.05) * flow_alpha  # NEW
+            WEIGHTS.get("flow_sentiment", 0.05) * flow_alpha
         ) * position_mult * RISK_MULT
 
         # Setup dict
@@ -196,20 +302,21 @@ class OvernightAlphaPipeline:
             gap=gap_dict,
             ml=ml_dict,
             sentiment=sent_dict,
-            flow_sentiment=flow_dict,  # NEW
+            flow_sentiment=flow_dict,
             skills=skills,
             technical=tech_summary,
             setup=setup_dict,
-            regime=regime_str
+            regime=regime_str,
+            hybrid_regime=hybrid_regime_dict  # NEW v4.2.2
         )
 
-    def run(self, tickers: List[str] = None) -> List[AlphaResult]:
+    def run(self, tickers: List[str] = None, headlines: List[str] = None) -> List[AlphaResult]:
         """Run pipeline across ticker universe."""
         universe = tickers or self.tickers
         results = []
 
         for ticker in universe:
-            res = self.run_ticker(ticker)
+            res = self.run_ticker(ticker, headlines=headlines)
             if res and res.alpha >= MIN_ALPHA:
                 results.append(res)
 
@@ -217,13 +324,13 @@ class OvernightAlphaPipeline:
         return results[:TOP_N]
 
 
-def run_pipeline(tickers: List[str] = None) -> List[Dict]:
+def run_pipeline(tickers: List[str] = None, headlines: List[str] = None) -> List[Dict]:
     """Public API: run overnight alpha pipeline and return serializable results."""
     if tickers is None:
         tickers = CONFIG.get("tickers", [])[:50]
 
     pipeline = OvernightAlphaPipeline(tickers)
-    results = pipeline.run()
+    results = pipeline.run(headlines=headlines)
 
     return [
         {
@@ -233,17 +340,19 @@ def run_pipeline(tickers: List[str] = None) -> List[Dict]:
             "gap": r.gap,
             "ml": r.ml,
             "sentiment": r.sentiment,
-            "flow_sentiment": r.flow_sentiment,  # NEW
+            "flow_sentiment": r.flow_sentiment,
             "skills": {
                 "composite": r.skills.get("composite_score", 0),
                 "triggered": r.skills.get("skills_triggered", 0)
             },
             "setup": r.setup,
-            "regime": r.regime
+            "regime": r.regime,
+            "hybrid_regime": r.hybrid_regime  # NEW v4.2.2
         }
         for r in results
     ]
 
 
 if __name__ == "__main__":
-    print("OvernightAlpha v4.2.1 ready: Full pipeline + EGX Flow Sentiment")
+    print("OvernightAlpha v4.2.2 ready: Full pipeline + Hybrid Regime Detector")
+    print("Features: Heuristic per-ticker + Claude macro (1 call/day) + Disagreement handling")

@@ -1,7 +1,7 @@
 {
   "project": "Sentinel-EGX",
-  "version": "4.2",
-  "description": "Complete integration: v3.7 components + v4.1 modular architecture + NEW full indicator suite + Gemini Flash Framework + EGX T+0/T+1 nuance + EXPANDED 263-ticker universe",
+  "version": "4.2.2",
+  "description": "Complete integration: v4.2 components + NEW Hybrid Regime Detector (heuristic + Claude macro + disagreement handling)",
   "eodhd_api_key": "YOUR_EODHD_API_KEY",
   "exchange": "EGX",
   "tickers": [
@@ -831,5 +831,36 @@
     "retail_fomo_penalty": -0.1,
     "cache_ttl_minutes": 30,
     "fallback_if_down": true
+  },
+  "regime_detector_v2": {
+    "heuristic": {
+      "thresholds": {
+        "strong_bull_slope": 0.05,
+        "weak_bull_slope": 0.01,
+        "strong_bear_slope": -0.05,
+        "weak_bear_slope": -0.01,
+        "vol_expanding": 1.2,
+        "vol_contracting": 0.8,
+        "shock_gap_pct": 0.1,
+        "shock_volume_mult": 5.0,
+        "t0_vol_spike_mult": 3.0,
+        "rsi_bull": 50,
+        "rsi_bear": 50
+      }
+    },
+    "macro": {
+      "model": "claude-3-haiku-20240307",
+      "max_tokens": 512,
+      "temperature": 0.2,
+      "cache_ttl_minutes": 360
+    },
+    "ensemble": {
+      "heuristic_weight": 0.6,
+      "macro_weight": 0.4,
+      "disagreement_threshold": 1.0,
+      "confidence_penalty_conflict": 0.5,
+      "risk_off_size_multiplier": 0.6,
+      "shock_size_multiplier": 0.5
+    }
   }
 }

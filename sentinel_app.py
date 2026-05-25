@@ -152,6 +152,13 @@ except Exception as e:
     MODULES_AVAILABLE["overnight_alpha"] = False
     st.sidebar.warning(f"overnight_alpha not loaded: {e}")
 
+# NEW v4.2.2: Hybrid Regime Detector
+try:
+    from regime_detector_v2 import HybridRegimeEnsemble, HeuristicRegimeDetector, MacroRegimeAnalyzer
+    MODULES_AVAILABLE["regime_detector_v2"] = True
+except Exception as e:
+    MODULES_AVAILABLE["regime_detector_v2"] = False
+    st.sidebar.warning(f"regime_detector_v2 not loaded: {e}")
 # ── SQLITE CACHE ──
 def _get_db():
     conn = sqlite3.connect(str(CACHE_DB))
@@ -315,6 +322,24 @@ with tab1:
                     c3.metric("Gap", f"{r['gap']['direction']} {r['gap']['probability']:.0%}")
                     c4.metric("R/R", f"{r['setup']['rr']:.1f}:1")
 
+                    # NEW v4.2.2: Hybrid Regime Display
+                    if 'hybrid_regime' in r and r['hybrid_regime']:
+                        hr = r['hybrid_regime']
+                        st.markdown("---")
+                        hr_c1, hr_c2, hr_c3, hr_c4 = st.columns(4)
+                        hr_c1.metric("Regime", hr.get('regime', 'unknown'))
+                        hr_c2.metric("Position Size", f"{hr.get('position_size', 1.0):.0%}")
+                        hr_c3.metric("Confidence", f"{hr.get('confidence', 0):.0%}")
+                        hr_c4.metric("Disagreement", f"{hr.get('disagreement_index', 0):.2f}")
+
+                        if hr.get('conflict_flag'):
+                            st.warning(f"⚠️ Conflict: Heuristic={hr.get('heuristic_regime')} vs Macro={hr.get('macro_score'):+.2f}")
+
+                        if hr.get('shock_detected'):
+                            st.error(f"🚨 Shock: {hr.get('shock_type')}")
+
+                        st.caption(f"💡 {hr.get('recommendation', '')}")
+                        st.markdown("---")
                     # Flow Sentiment
                     if 'flow_sentiment' in r and r['flow_sentiment']:
                         flow = r['flow_sentiment']
@@ -602,6 +627,114 @@ with tab5:
     st.dataframe(seg_df, hide_index=True)
 
     st.subheader("🧠 Gap Model Training")
+    # NEW v4.2.2: Regime Analysis
+    st.subheader("🧠 Regime Analysis")
+    st.caption("Hybrid regime detection: Heuristic per-ticker + Claude macro (1 call/day) + Disagreement handling")
+
+    if MODULES_AVAILABLE.get("regime_detector_v2"):
+        col_reg1, col_reg2 = st.columns([1, 2])
+
+        with col_reg1:
+            regime_ticker = st.selectbox(
+                "Select ticker for regime analysis",
+                options=ALL_TICKERS,
+                key="regime_ticker"
+            )
+            regime_segment = TICKER_TO_SEGMENT.get(regime_ticker, "moderate_activity")
+
+            # Optional headlines input for macro analysis
+            st.caption("Optional: Add headlines for Claude macro analysis")
+            headline_input = st.text_area(
+                "Headlines (one per line)",
+                value="CBE maintains interest rates\nEGX trading volume rises on foreign buying",
+                height=80,
+                key="regime_headlines"
+            )
+            headlines = [h.strip() for h in headline_input.split("\n") if h.strip()]
+
+            run_regime = st.button("🔍 Analyze Regime", type="primary")
+
+        with col_reg2:
+            if run_regime:
+                with st.spinner(f"Analyzing regime for {regime_ticker}..."):
+                    try:
+                        from regime_detector_v2 import HybridRegimeEnsemble
+                        ensemble = HybridRegimeEnsemble()
+
+                        df_reg = fetch_and_build(regime_ticker, "EGX", lookback=100, use_cache=True)
+                        hybrid = ensemble.detect(
+                            df_reg,
+                            ticker=regime_ticker,
+                            segment=regime_segment,
+                            headlines=headlines if headlines else None
+                        )
+
+                        st.subheader("📊 Hybrid Regime Result")
+
+                        rc1, rc2, rc3, rc4 = st.columns(4)
+                        rc1.metric("Final Regime", hybrid.regime)
+                        rc2.metric("Position Size", f"{hybrid.position_size:.0%}")
+                        rc3.metric("Confidence", f"{hybrid.confidence:.0%}")
+                        rc4.metric("Disagreement", f"{hybrid.disagreement_index:.2f}")
+
+                        st.progress(hybrid.confidence, text=f"Confidence: {hybrid.confidence:.0%}")
+
+                        # Heuristic vs Macro breakdown
+                        st.subheader("🔍 Layer Breakdown")
+                        h = hybrid.heuristic
+                        m = hybrid.macro
+
+                        h_c1, h_c2 = st.columns(2)
+                        with h_c1:
+                            st.markdown("**Heuristic Layer (per-ticker)**")
+                            st.write(f"Regime: `{h.regime}`")
+                            st.write(f"Slope: {h.slope_pct}% | RSI: {h.rsi}")
+                            st.write(f"Volatility: {h.volatility_annual}")
+                            st.write(f"Shock: {'🚨 ' + h.shock_type if h.shock_detected else '✅ None'}")
+                            st.write(f"T+0 Spike: {'🔥 Yes' if h.t0_volatility_spike else '✅ No'}")
+
+                        with h_c2:
+                            st.markdown("**Macro Layer (Claude, market-wide)**")
+                            st.write(f"Score: {m.macro_score:+.2f}")
+                            st.write(f"Confidence: {m.confidence:.0%}")
+                            st.write(f"Risk-off: {'🚨 Yes' if m.risk_off_flag else '✅ No'}")
+                            st.write(f"Risk-on: {'🚀 Yes' if m.risk_on_flag else '✅ No'}")
+                            st.write(f"Source: {m.source}")
+                            if m.key_factors:
+                                st.write(f"Factors: {', '.join(m.key_factors[:3])}")
+
+                        # Recommendation
+                        st.info(f"💡 **Recommendation:** {hybrid.recommendation}")
+
+                        # Conflict/shock alerts
+                        if hybrid.conflict_flag:
+                            st.warning("⚠️ **CONFLICT DETECTED** — Heuristic and macro disagree. Reduce position or skip.")
+
+                        if h.shock_detected:
+                            st.error(f"🚨 **SHOCK DETECTED:** {h.shock_type} — Do not add new positions.")
+
+                        # Paper trading log
+                        st.subheader("📝 Paper Trading Log Entry")
+                        log_entry = f"""
+Date: {hybrid.timestamp[:10]}
+Ticker: {regime_ticker}
+Regime: {hybrid.regime}
+Heuristic: {h.regime} | Macro: {m.macro_score:+.2f}
+Disagreement: {hybrid.disagreement_index} | Conflict: {hybrid.conflict_flag}
+Recommendation: {hybrid.recommendation}
+Action: 
+Outcome: 
+"""
+                        st.code(log_entry)
+
+                    except Exception as e:
+                        st.error(f"Regime analysis failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+    else:
+        st.warning("regime_detector_v2 not available. Please ensure regime_detector_v2.py is in the project directory.")
+
+    st.divider()
     st.caption("Train the overnight gap predictor on historical EOD data. Required before ML gap predictions.")
 
     col_train1, col_train2 = st.columns([1, 3])
