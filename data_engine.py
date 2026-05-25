@@ -1,13 +1,17 @@
 """
-Sentinel-EGX v4.2.1 — Data Engine
-==================================
-EODHD fetcher + all 9 indicators + T+0 segment awareness + SQLite cache
-FIXED v4.2.1:
+Sentinel-EGX v4.2.2 — Data Engine (Delta-Update Enhanced)
+==========================================================
+EODHD fetcher + 9 indicators + T+0 segment awareness + NEW DeltaCache integration.
+FIXED v4.2.1 → v4.2.2:
   - Double exchange suffix bug (COMI.EGX.EGX → COMI.EGX)
   - Synthetic calendar: Sun-Thu (was incorrectly Mon-Fri)
   - Debug logging for URL, HTTP status, cache hits
   - DataCache.clear() for cache invalidation
   - Export API keys to os.environ for child modules
+NEW v4.2.2:
+  - DeltaCache integration: fetches only missing date ranges
+  - Backward-compatible: falls back to legacy DataCache if DeltaCache unavailable
+  - EGX trading-day aware gap detection
 """
 
 import pandas as pd
@@ -80,7 +84,11 @@ class EGXCalendar:
         return sum(1 for d in self.trading_days if start <= d <= end)
 
 
+# ── LEGACY CACHE (backward compatible) ──
+
 class DataCache:
+    """Legacy full-DataFrame blob cache (kept for backward compatibility)."""
+
     def __init__(self, db_path: str = str(CACHE_DB)):
         self.conn = sqlite3.connect(db_path)
         self._init_tables()
@@ -121,145 +129,197 @@ class DataCache:
         self.conn.commit()
 
 
-def _build_url(symbol: str, exchange: str, period: str, days: int) -> str:
-    """Build EODHD API URL. FIX v4.2.1: strip duplicate exchange suffix if present in symbol."""
-    end = datetime.now()
-    start = end - timedelta(days=days + 30)
-    fmt = "%Y-%m-%d"
-    base = "https://eodhd.com/api/eod"
+# ── DELTA CACHE INTEGRATION ──
 
-    # FIX v4.2.1: avoid double suffix like COMI.EGX.EGX
+try:
+    from delta_cache import DeltaCache
+    DELTA_CACHE_AVAILABLE = True
+except ImportError:
+    DELTA_CACHE_AVAILABLE = False
+
+
+def _build_url(symbol: str, exchange: str, period: str, from_date: str, to_date: str) -> str:
+    """Build EODHD API URL. FIX v4.2.1: strip duplicate exchange suffix if present in symbol."""
+    base = "https://eodhd.com/api/eod"
     suffix = f".{exchange}"
     if symbol.upper().endswith(suffix.upper()):
         symbol_clean = symbol[:-len(suffix)]
     else:
         symbol_clean = symbol
 
-    url = f"{base}/{symbol_clean}.{exchange}?from={start.strftime(fmt)}&to={end.strftime(fmt)}&period={period}&api_token={EODHD_API_KEY}&fmt=json"
+    url = f"{base}/{symbol_clean}.{exchange}?from={from_date}&to={to_date}&period={period}&api_token={EODHD_API_KEY}&fmt=json"
     return url
 
 
+def _parse_eodhd_response(data: list, symbol: str) -> Optional[pd.DataFrame]:
+    """Parse raw EODHD JSON into clean DataFrame."""
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    if df.empty:
+        return None
+
+    col_map = {}
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower in ["date", "datetime", "timestamp"]:
+            col_map[col] = "date"
+        elif col_lower in ["open", "o"]:
+            col_map[col] = "open"
+        elif col_lower in ["high", "h"]:
+            col_map[col] = "high"
+        elif col_lower in ["low", "l"]:
+            col_map[col] = "low"
+        elif col_lower in ["close", "c", "adjusted_close", "adj_close"]:
+            col_map[col] = "close"
+        elif col_lower in ["volume", "vol", "v"]:
+            col_map[col] = "volume"
+
+    df = df.rename(columns=col_map)
+    required = ["date", "open", "high", "low", "close", "volume"]
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        return None
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["close"])
+    return df
+
+
+def _fetch_eodhd_range(symbol: str, exchange: str, period: str,
+                       from_date: str, to_date: str) -> Optional[pd.DataFrame]:
+    """Fetch a specific date range from EODHD (used by delta fetcher)."""
+    if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY":
+        return None
+
+    url = _build_url(symbol, exchange, period, from_date, to_date)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 403:
+                print(f"[DataEngine] ⚠️ EODHD quota exceeded (403) for {symbol}")
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            df = _parse_eodhd_response(data, symbol)
+            if df is not None and len(df) >= 1:
+                return df
+            time.sleep(1)
+        except Exception as e:
+            time.sleep(1)
+            continue
+    return None
+
+
 def fetch_eod(symbol: str, exchange: str = "EGX", period: str = "d", days: int = 500,
-              use_synthetic_fallback: bool = True) -> Optional[pd.DataFrame]:
+              use_synthetic_fallback: bool = True, use_delta_cache: bool = True) -> Optional[pd.DataFrame]:
     """
-    Fetch EOD data from EODHD with retry, cache, and synthetic fallback.
+    Fetch EOD data with delta-update caching.
+
+    Strategy:
+      1. If DeltaCache available and enabled: check gaps, fetch only missing ranges, merge
+      2. If DeltaCache unavailable/disabled: fall back to legacy DataCache (full blob)
+      3. If all cache misses: full EODHD fetch
+      4. Synthetic fallback if EODHD fails
     """
+    end = datetime.now()
+    start = end - timedelta(days=days + 30)
+    req_start = start.strftime("%Y-%m-%d")
+    req_end = end.strftime("%Y-%m-%d")
+
+    # ── PATH A: DeltaCache (intelligent) ──
+    if use_delta_cache and DELTA_CACHE_AVAILABLE:
+        dc = DeltaCache()
+        meta = dc.get_meta(symbol)
+
+        # Check if we have ANY data and it's fresh enough
+        if meta and not dc.needs_refresh(symbol, req_end, ttl_hours=CACHE_TTL_HOURS):
+            # Fully cached and fresh — just return it
+            full = dc.get_data(symbol, req_start, req_end)
+            if full is not None and len(full) >= 20:
+                print(f"[DataEngine] DeltaCache hit: {len(full)} bars for {symbol} (fully cached)")
+                return full
+
+        # Partial or stale — detect gaps
+        # Build trading day list for gap detection
+        cal = EGXCalendar(req_start, req_end)
+        trading_day_strs = [d.strftime("%Y-%m-%d") for d in cal.trading_days]
+        missing_ranges = dc.get_missing_ranges(symbol, req_start, req_end, trading_day_strs)
+
+        if not missing_ranges:
+            # All trading days cached — just return
+            full = dc.get_data(symbol, req_start, req_end)
+            if full is not None and len(full) >= 20:
+                dc._update_meta(symbol, full)
+                print(f"[DataEngine] DeltaCache: all {len(full)} bars present for {symbol}")
+                return full
+
+        print(f"[DataEngine] DeltaCache gaps for {symbol}: {len(missing_ranges)} range(s) to fetch")
+
+        # Fetch each missing range
+        fetched_frames = []
+        for from_d, to_d in missing_ranges:
+            print(f"[DataEngine] Fetching delta: {symbol} [{from_d} → {to_d}]")
+            df_chunk = _fetch_eodhd_range(symbol, exchange, period, from_d, to_d)
+            if df_chunk is not None and not df_chunk.empty:
+                fetched_frames.append(df_chunk)
+                dc.insert_data(symbol, df_chunk, source="eodhd")
+            else:
+                print(f"[DataEngine] ⚠️ Failed to fetch delta range [{from_d} → {to_d}]")
+
+        # Merge all cached + new data
+        full = dc.get_data(symbol, req_start, req_end)
+        if full is not None and len(full) >= 20:
+            print(f"[DataEngine] DeltaCache merged: {len(full)} bars for {symbol}")
+            return full
+
+        # If delta fetch failed, fall through to full fetch
+        print(f"[DataEngine] Delta fetch incomplete, falling back to full fetch for {symbol}")
+
+    # ── PATH B: Legacy DataCache (full blob) ──
+    legacy = DataCache()
+    cached = legacy.get(symbol)
+    if cached is not None:
+        print(f"[DataEngine] Legacy cache hit for {symbol}")
+        return cached
+
+    # ── PATH C: Full EODHD fetch ──
     if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY":
         if use_synthetic_fallback:
             print(f"[DataEngine] No API key, using synthetic data for {symbol}")
             return _generate_synthetic_data(symbol, days)
         raise ValueError("EODHD_API_KEY not found. Set it in: 1) Streamlit Secrets, 2) .env file, or 3) sentinel_config.json")
 
-    # Check cache first
-    cache = DataCache()
-    cached = cache.get(symbol)
-    if cached is not None:
-        print(f"[DataEngine] Cache hit for {symbol}")
-        return cached
+    df = _fetch_eodhd_range(symbol, exchange, period, req_start, req_end)
+    if df is not None and len(df) >= 20:
+        legacy.set(symbol, df)
+        if DELTA_CACHE_AVAILABLE:
+            dc = DeltaCache()
+            dc.insert_data(symbol, df, source="eodhd")
+        print(f"[DataEngine] Full fetch: {len(df)} bars for {symbol}")
+        return df
 
-    # Try EODHD with retry
-    url = _build_url(symbol, exchange, period, days)
-    last_error = None
-    print(f"[DataEngine] Fetching EODHD: {url.replace(EODHD_API_KEY, '***')}")
-
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, timeout=30)
-            print(f"[DataEngine] HTTP {resp.status_code} for {symbol} (attempt {attempt+1})")
-            resp.raise_for_status()
-            data = resp.json()
-
-            if not data:
-                last_error = "Empty response from EODHD"
-                time.sleep(1)
-                continue
-
-            df = pd.DataFrame(data)
-
-            # Handle different column name formats
-            col_map = {}
-            for col in df.columns:
-                col_lower = col.lower()
-                if col_lower in ["date", "datetime", "timestamp"]:
-                    col_map[col] = "date"
-                elif col_lower in ["open", "o"]:
-                    col_map[col] = "open"
-                elif col_lower in ["high", "h"]:
-                    col_map[col] = "high"
-                elif col_lower in ["low", "l"]:
-                    col_map[col] = "low"
-                elif col_lower in ["close", "c", "adjusted_close", "adj_close"]:
-                    col_map[col] = "close"
-                elif col_lower in ["volume", "vol", "v"]:
-                    col_map[col] = "volume"
-
-            df = df.rename(columns=col_map)
-
-            # Ensure required columns exist
-            required = ["date", "open", "high", "low", "close", "volume"]
-            missing_cols = [c for c in required if c not in df.columns]
-            if missing_cols:
-                last_error = f"Missing columns: {missing_cols}"
-                time.sleep(1)
-                continue
-
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date").reset_index(drop=True)
-
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            df = df.dropna(subset=["close"])
-
-            if len(df) < 20:
-                last_error = f"Only {len(df)} bars returned"
-                time.sleep(1)
-                continue
-
-            cache.set(symbol, df)
-            print(f"[DataEngine] Success: {len(df)} bars cached for {symbol}")
-            time.sleep(0.1)
-            return df
-
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else 0
-            if status == 403:
-                last_error = "EODHD API quota exceeded (403). Upgrade plan or wait for daily reset."
-                print(f"[DataEngine] ⚠️ {last_error}")
-                # Don't retry on quota error
-                break
-            else:
-                last_error = f"HTTP {status}: {str(e)}"
-                time.sleep(1)
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(1)
-            continue
-
-    # All retries failed
-    print(f"[DataEngine] EODHD failed for {symbol} after 3 attempts: {last_error}")
-
+    # ── PATH D: Synthetic fallback ──
+    print(f"[DataEngine] EODHD failed for {symbol}, using synthetic fallback")
     if use_synthetic_fallback:
-        print(f"[DataEngine] Falling back to synthetic data for {symbol}")
         return _generate_synthetic_data(symbol, days)
-
     return None
 
 
 def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
     """Generate realistic synthetic OHLCV data for testing when EODHD is unavailable.
-    FIX v4.2.1: EGX trades Sun-Thu (not Mon-Fri).
+    EGX trades Sun-Thu.
     """
     import numpy as np
-
     np.random.seed(hash(symbol) % 2**32)
 
-    # Generate trading days (Sun-Thu for EGX)
     end = datetime.now()
     dates = []
     current = end - timedelta(days=int(days * 1.5))
     while current <= end:
-        # Sunday=6, Monday=0, Tuesday=1, Wednesday=2, Thursday=3
         if current.weekday() in (0, 1, 2, 3, 6):
             dates.append(current)
         current += timedelta(days=1)
@@ -267,7 +327,6 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
     dates = dates[-days:] if len(dates) > days else dates
     n = len(dates)
 
-    # Generate realistic price path
     base_price = np.random.uniform(5, 200)
     annual_vol = np.random.uniform(0.20, 0.45)
     daily_vol = annual_vol / np.sqrt(252)
@@ -276,17 +335,14 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
     returns = np.random.normal(drift, daily_vol, n)
     prices = base_price * np.exp(np.cumsum(returns))
 
-    # Generate OHLC from close
     daily_range = prices * daily_vol * np.random.uniform(0.5, 2.0, n)
     high = prices + daily_range * np.random.uniform(0.3, 0.7, n)
     low = prices - daily_range * np.random.uniform(0.3, 0.7, n)
     open_p = prices + np.random.normal(0, daily_vol * prices * 0.3, n)
 
-    # Ensure OHLC consistency
     high = np.maximum(high, np.maximum(open_p, prices))
     low = np.minimum(low, np.minimum(open_p, prices))
 
-    # Volume
     base_vol = np.random.uniform(100_000, 5_000_000)
     volume = base_vol * (1 + 3 * (daily_range / prices)) * np.random.uniform(0.3, 3.0, n)
 
@@ -301,7 +357,6 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
 
     df.attrs["synthetic"] = True
     df.attrs["ticker"] = symbol
-
     return df
 
 
@@ -445,11 +500,15 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_and_build(symbol: str, exchange: str = "EGX", lookback: int = 400,
-                    use_cache: bool = True, allow_synthetic: bool = True) -> pd.DataFrame:
+                    use_cache: bool = True, allow_synthetic: bool = True,
+                    use_delta_cache: bool = True) -> pd.DataFrame:
     """
     Fetch and build full indicator-enriched dataframe.
+    NEW v4.2.2: use_delta_cache=True triggers intelligent gap fetching.
     """
-    df = fetch_eod(symbol, exchange, "d", lookback, use_synthetic_fallback=allow_synthetic)
+    df = fetch_eod(symbol, exchange, "d", lookback,
+                   use_synthetic_fallback=allow_synthetic,
+                   use_delta_cache=use_delta_cache)
 
     if df is None:
         raise ValueError(
@@ -472,5 +531,50 @@ def fetch_and_build(symbol: str, exchange: str = "EGX", lookback: int = 400,
     return df
 
 
+def get_cache_stats() -> Dict:
+    """Return stats for both legacy and delta caches."""
+    stats = {"legacy": {}, "delta": {}}
+    try:
+        legacy = DataCache()
+        conn = legacy.conn
+        cursor = conn.execute("SELECT COUNT(*), MAX(fetched_at) FROM eod_cache")
+        row = cursor.fetchone()
+        stats["legacy"] = {"symbols": row[0], "latest_fetch": row[1]}
+    except Exception as e:
+        stats["legacy"] = {"error": str(e)}
+
+    if DELTA_CACHE_AVAILABLE:
+        try:
+            dc = DeltaCache()
+            stats["delta"] = dc.get_stats()
+            stats["delta"]["symbols_list"] = dc.list_symbols()
+        except Exception as e:
+            stats["delta"] = {"error": str(e)}
+    else:
+        stats["delta"] = {"status": "unavailable"}
+
+    return stats
+
+
+def clear_all_caches():
+    """Clear both legacy and delta caches."""
+    try:
+        legacy = DataCache()
+        legacy.clear()
+    except Exception as e:
+        print(f"[DataEngine] Legacy cache clear error: {e}")
+
+    if DELTA_CACHE_AVAILABLE:
+        try:
+            dc = DeltaCache()
+            dc.clear_all()
+        except Exception as e:
+            print(f"[DataEngine] Delta cache clear error: {e}")
+
+    print("[DataEngine] All caches cleared.")
+
+
 if __name__ == "__main__":
-    print("DataEngine v4.2.1 ready: EODHD fetch + 9 indicators + T+0 awareness + URL fix")
+    print("DataEngine v4.2.2 ready: EODHD fetch + DeltaCache + 9 indicators + T+0 awareness")
+    print(f"DeltaCache available: {DELTA_CACHE_AVAILABLE}")
+    print(f"EODHD API key configured: {'Yes' if EODHD_API_KEY and EODHD_API_KEY != 'YOUR_EODHD_API_KEY' else 'No'}")

@@ -86,7 +86,6 @@ def _detect_trend_following(df: pd.DataFrame) -> Optional[SkillResult]:
     ema20 = df["close"].ewm(span=20, adjust=False).mean().iloc[-1]
     ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
 
-    # ADX proxy
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift()).abs()
     tr3 = (df["low"] - df["close"].shift()).abs()
@@ -143,7 +142,6 @@ def _detect_gap_fill(df: pd.DataFrame) -> Optional[SkillResult]:
 
     if abs(gap) > 0.01:  # > 1% gap
         direction = "bearish" if gap > 0 else "bullish"  # gap up = likely fill down
-        # Gap fill probability: larger gaps less likely to fill same day
         fill_prob = max(0.3, 1.0 - abs(gap) * 10)
         return SkillResult(
             skill="gap_fill",
@@ -162,7 +160,6 @@ def _detect_support_bounce(df: pd.DataFrame) -> Optional[SkillResult]:
     latest = df.iloc[-1]
     low20 = df["low"].rolling(20).min().iloc[-1]
 
-    # Calculate pivot S1
     prev = df.iloc[-2] if len(df) > 1 else latest
     pp = (prev["high"] + prev["low"] + prev["close"]) / 3
     s1 = 2 * pp - prev["high"]
@@ -276,7 +273,8 @@ def get_skill_summary(skills_result: Dict) -> str:
     for d in skills_result.get("triggered_details", []):
         emoji = "🔥" if d["skill"] == "breakout" else "🔄" if d["skill"] == "mean_reversion" else                 "📈" if d["skill"] == "trend_following" else "💥" if d["skill"] == "volume_spike" else                 "🌙" if d["skill"] == "gap_fill" else "🛡️" if d["skill"] == "support_bounce" else "🚫"
         lines.append(f"  {emoji} {d['skill']}: {d['direction']} ({d['confidence']:.0%}) — {d['details']}")
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 if __name__ == "__main__":

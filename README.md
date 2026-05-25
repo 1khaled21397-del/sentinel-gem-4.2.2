@@ -1,185 +1,207 @@
-# Sentinel-EGX v4.2
+# 🛡️ Sentinel-EGX v4.2.2
 
-> **Complete EGX Stock Scanner & Overnight Alpha Pipeline**  
-> 263-ticker universe | EOD Data Only | T+0/T+1 Aware | Gemini Flash Framework
+**AI-Powered Overnight Alpha & Technical Analysis for the Egyptian Exchange (EGX)**
 
----
-
-## ⚠️ DISCLAIMER
-
-**Sentinel is a financial analytics and data visualization platform. All forecasts, signals, and AI-generated content are for informational and educational purposes only. Users must conduct their own research and consult a licensed financial advisor before making investment decisions. Sentinel does not provide investment advice, manage portfolios, or execute trades.**
+> EOD data only | 263-ticker universe | T+0/T+1 aware | Delta-Update Caching
 
 ---
 
-## Architecture Overview
+## 📋 Overview
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                    Sentinel-EGX v4.2 Pipeline                    │
-├────────────────────────────────────────────────────────────────────────────┤
-│  Data Layer                                                      │
-│    ├── data_engine.py        → EODHD fetch + 9 indicators       │
-│    └── sentinel_cache.db      → SQLite TTL cache (6h)           │
-├────────────────────────────────────────────────────────────────────────────┤
-│  Analysis Layer                                                  │
-│    ├── technical_analysis.py → VWAP, CMF, OBV, RSI, StochRSI  │
-│    │                            MACD, EMA20/50, SMA200          │
-│    ├── gap_predictor.py      → 35-feature gap prediction        │
-│    ├── ml_forecast.py        → XGBoost + Random Forest ensemble │
-│    ├── auto_skills.py        → 7 pattern recognition skills     │
-│    ├── sentiment_scraper.py  → Keyword-based sentiment scoring  │
-│    └── regime_detector.py    → Bull/sideways/bear classifier    │
-├────────────────────────────────────────────────────────────────────────────┤
-│  Integration Layer                                               │
-│    ├── overnight_alpha.py    → Full pipeline orchestrator       │
-│    ├── hedge_engine.py       → EGX30 futures beta hedge         │
-│    └── backtest_engine.py    → Walk-forward backtester          │
-├────────────────────────────────────────────────────────────────────────────┤
-│  Presentation Layer                                              │
-│    └── sentinel_app.py       → Streamlit dashboard              │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+Sentinel-EGX is a comprehensive quantitative trading intelligence system for the Egyptian Stock Exchange (EGX). It combines:
+
+- **Technical Analysis**: VWAP, Anchored VWAP, CMF, OBV, RSI, Stochastic RSI, MACD, EMA 20/50, SMA 200
+- **ML Forecasting**: XGBoost + Random Forest ensemble for 7-day return prediction
+- **Gap Prediction**: 35-feature model for overnight gap forecasting
+- **Sentiment Analysis**: Triple AI (Claude + Kimi + Gemini) with keyword fallback
+- **Hybrid Regime Detection**: Heuristic per-ticker + Claude macro + disagreement handling
+- **Auto Skills**: 7 pattern recognition algorithms (breakout, mean reversion, trend following, etc.)
+- **Delta-Update Caching**: Intelligent EOD data caching — fetches only missing date ranges
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-### 1. Install Dependencies
+### Prerequisites
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure API Keys
+### Environment Variables
 
-Create `.env` in project root:
+Create a `.env` file or set Streamlit Secrets:
 
-```bash
-EODHD_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
-KIMI_API_KEY=your_key_here
+```
+EODHD_API_KEY=your_eodhd_key
+ANTHROPIC_API_KEY=your_claude_key
+KIMI_API_KEY=your_kimi_key
+GEMINI_API_KEY=your_gemini_key
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-Or add to Streamlit Secrets for cloud deployment.
-
-### 3. Run Streamlit App
+### Run Streamlit App
 
 ```bash
 streamlit run sentinel_app.py
 ```
 
-### 4. Run Pre-Market Pipeline (CLI)
+### Run GitHub Actions Pipeline
 
-```bash
-python overnight_alpha.py
+The pre-market pipeline runs automatically at 06:30 Cairo time (Sun-Thu):
+- Fetches EOD data (delta-update: only missing ranges)
+- Runs full analysis pipeline
+- Sends Telegram digest with top setups
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  EODHD API      │────▶│  DeltaCache     │────▶│  data_engine    │
+│  (EOD data)     │     │  (row-level)    │     │  (indicators)   │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+                                                         │
+    ┌──────────────────────────────────────────────────────┘
+    ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ technical_      │────▶│  overnight_     │────▶│  sentinel_app   │
+│ analysis.py     │     │  alpha.py       │     │  (Streamlit UI) │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+    │                           │
+    ▼                           ▼
+┌─────────────────┐     ┌─────────────────┐
+│  gap_predictor  │     │  ml_forecast    │
+│  (35 features)  │     │  (XGB + RF)     │
+└─────────────────┘     └─────────────────┘
+    │                           │
+    └──────────┬────────────────┘
+               ▼
+        ┌─────────────────┐
+        │  regime_detector│
+        │  (hybrid)       │
+        └─────────────────┘
 ```
 
 ---
 
-## Key Features
+## 📁 File Structure
 
-| Feature | Description | Config Key |
-|---------|-------------|------------|
-| **263 Tickers** | Complete EGX universe | `tickers` |
-| **T+0/T+1 Filter** | Segment-aware liquidity scoring | `t0_rules` |
-| **Gemini Flash** | 3-step framework (Trend → Volume → Timing) | `gemini_flash_framework` |
-| **Gap Prediction** | 35 features, XGB/RF ensemble | `gap_predictor` |
-| **ML Forecast** | 7-day return prediction | `ml_forecast` |
-| **7 Auto Skills** | Breakout, mean reversion, trend, volume, gap fill, S/R | `auto_skills` |
-| **Walk-Forward Backtest** | 5-split regime-aware testing | `backtest` |
-| **Hedge Engine** | EGX30 futures beta-adjusted | `hedge_engine` |
-| **Telegram Digest** | Daily pre-market alerts | `telegram` |
-
----
-
-## T+0/T+1 Market Segments (EGX Feb 2024)
-
-| Segment | T+0 Eligible | Price Limit | Examples |
-|---------|-------------|-------------|----------|
-| `egx30` | ✅ Yes | ±30% | COMI, HRHO, TMGH |
-| `egx70` | ✅ Yes | ±15% | DSCW, MEPA, ATQA |
-| `high_activity` | ✅ Yes | ±20% | FWRY, ORWE, EFID |
-| `moderate_activity` | ✅ Yes | ±20% | EFIC, CIEB, SVCE |
-| `low_activity` | ❌ T+1 Only | ±5% | BTFH, SIDI, FPCM |
+| File | Purpose |
+|------|---------|
+| `sentinel_app.py` | Streamlit UI — Scanner, Single Stock, Watchlists, Diagnostics |
+| `data_engine.py` | EODHD fetcher + 9 indicators + **DeltaCache integration** |
+| `delta_cache.py` | **NEW v4.2.2** — Row-level SQLite cache with gap detection |
+| `technical_analysis.py` | Full TA engine (VWAP, CMF, OBV, RSI, StochRSI, MACD, EMA/SMA) |
+| `gap_predictor.py` | 35-feature overnight gap prediction (XGB/RF) |
+| `ml_forecast.py` | 7-day return forecast (XGBoost + Random Forest ensemble) |
+| `sentiment_scraper.py` | Triple AI sentiment (Claude + Kimi + Gemini) |
+| `regime_detector.py` | Hybrid regime detection (heuristic + macro + ensemble) |
+| `auto_skills.py` | 7 pattern recognition skills |
+| `overnight_alpha.py` | Full pipeline orchestrator |
+| `backtest_engine.py` | Walk-forward backtesting |
+| `hedge_engine.py` | EGX30 futures beta-adjusted hedging |
+| `egx_flow_scraper.py` | EGX market flow sentiment |
+| `sentinel_config.json` | Central configuration |
+| `deploy.yml` | GitHub Actions pre-market pipeline |
+| `devcontainer.json` | GitHub Codespaces configuration |
+| `requirements.txt` | Python dependencies |
 
 ---
 
-## Module Reference
+## 🔄 Delta-Update Caching (v4.2.2)
 
-### `data_engine.py`
-- `fetch_and_build(symbol, exchange="EGX", lookback=400)` → enriched DataFrame
-- `get_segment(ticker)` → market segment lookup
-- `EGXCalendar(start, end)` → trading day generator
+### Problem
+Previously, `data_engine.py` stored entire DataFrames as JSON blobs in SQLite. Every cache refresh required re-fetching the full history — expensive for 263 tickers on a $20/mo EODHD plan.
 
-### `technical_analysis.py`
-- `analyze_ticker(df, ticker, segment)` → (IndicatorSnapshot, SetupQuality)
-- `get_indicator_summary(snapshot)` → UI-ready dict
+### Solution
+**DeltaCache** stores data **per-row** (symbol + date PK) and only fetches missing trading days:
 
-### `gap_predictor.py`
-- `predict_overnight_gap(df, ticker, segment)` → GapPrediction
-- `train_gap_model(historical_data, segments)` → (predictor, metrics)
+```python
+from delta_cache import DeltaCache
 
-### `ml_forecast.py`
-- `MLForecastEngine.train(df)` → fits XGB+RF ensemble
-- `MLForecastEngine.predict(df)` → 7-day return forecast
+dc = DeltaCache()
 
-### `auto_skills.py`
-- `analyze_skills(df, ticker, segment)` → composite score + triggered skills
+# Check what's missing
+gaps = dc.get_missing_ranges("COMI.EGX", "2024-01-01", "2026-05-25")
+# Returns: [("2026-05-20", "2026-05-25")]  # only 6 days to fetch!
 
-### `overnight_alpha.py`
-- `run_pipeline(tickers)` → top setups sorted by alpha score
+# Fetch delta, merge, return full dataset
+full_df = dc.merge_fetch("COMI.EGX", new_data)
+```
+
+### Benefits
+- **~95% fewer API calls** for daily updates
+- **Faster startup** (no full re-fetch)
+- **Separate DB** (`sentinel_delta_cache.db`) — no migration from legacy cache
+- **Backward compatible** — falls back to legacy `DataCache` if unavailable
 
 ---
 
-## Configuration
+## 📊 Key Features
 
-All behavior is controlled by `sentinel_config.json`:
+### T+0 / T+1 Awareness
+EGX market segments (per Feb 2024 restructure):
+- **T+0**: high_activity, moderate_activity, egx30
+- **T+1 only**: low_activity
+
+### Gemini Flash Framework
+3-step entry confirmation:
+1. **Trend**: EMA50 > SMA200
+2. **Volume**: OBV rising + CMF > 0
+3. **Timing**: RSI pullback to 40-50 + price near EMA20
+
+### Hybrid Regime Detection
+- **Layer 1**: Enhanced heuristic (per-ticker, free, deterministic)
+- **Layer 2**: Claude macro analyzer (market-wide, 1 call/day)
+- **Layer 3**: Ensemble with disagreement handling + EGX shock detection
+
+---
+
+## ⚙️ Configuration
+
+Edit `sentinel_config.json`:
 
 ```json
 {
+  "cache_ttl_hours": 12,
+  "technical_analysis": {
+    "ema_periods": [20, 50],
+    "sma_periods": [200],
+    "rsi_period": 14
+  },
   "alpha_scorer": {
-    "weights": {
-      "gap_magnitude": 0.20,
-      "gap_confidence": 0.15,
-      "ml_7d": 0.15,
-      "sentiment": 0.15,
-      "auto_skills": 0.10,
-      "technical": 0.10,
-      "weekly_confluence": 0.10,
-      "sr_bonus": 0.05
-    }
+    "min_alpha_to_report": 0.55,
+    "top_n_setups": 10
   }
 }
 ```
 
 ---
 
-## Deployment
+## 🧪 Testing
 
-### GitHub Actions (Pre-Market Pipeline)
+```bash
+# Verify all imports
+python -c "import data_engine; import delta_cache; import technical_analysis; print('OK')"
 
-See `deploy.yml` for cron-scheduled pipeline at 06:30 Cairo time (Sun-Thu).
+# Test DeltaCache
+dc = DeltaCache()
+dc.get_missing_ranges("COMI.EGX", "2024-01-01", "2026-05-25")
 
-### Dev Container / Codespaces
-
-Open in GitHub Codespaces — `.devcontainer/devcontainer.json` pre-configured.
-
----
-
-## License
-
-MIT License — see full text in repository.
-
----
-
-## Version History
-
-| Version | Date | Key Changes |
-|---------|------|-------------|
-| v3.7 | 2024 | 87 tickers, VAMP prediction, basic backtest |
-| v4.1 | 2025 | Modular architecture, sentiment scraper |
-| **v4.2** | **2026** | **263 tickers, Gemini Flash, T+0/T+1, full indicator suite** |
+# Test synthetic data
+df = data_engine._generate_synthetic_data("TEST.EGX", 100)
+assert len(df) == 100
+```
 
 ---
 
-*Built for the Egyptian Exchange (EGX). EOD data only — no intraday feeds available.*
+## 📜 License
+
+MIT License — see LICENSE file
+
+---
+
+**Version**: 4.2.2 | **Date**: 2026-05-25 | **Exchange**: EGX (Egyptian Exchange)

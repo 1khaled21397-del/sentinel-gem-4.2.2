@@ -209,7 +209,8 @@ class GapPredictor:
         prob = self.model.predict_proba(latest)[0][1]  # probability of gap > threshold
         pred_class = self.model.predict(latest)[0]
 
-        direction = "up" if pred_class == 1 and df["close"].pct_change(1).iloc[-1] > 0 else                     "down" if pred_class == 1 else "neutral"
+        direction = "up" if pred_class == 1 and df["close"].pct_change(1).iloc[-1] > 0 else \
+                    "down" if pred_class == 1 else "neutral"
 
         magnitude = self.threshold * (1 + prob)
 

@@ -2,6 +2,7 @@
 Sentinel-EGX v4.2 — Backtest Engine
 Walk-forward simulation for overnight gap strategy
 Ported and enhanced from v3.7, aligned with sentinel_config.json v4.2
+NEW v4.2.2: DeltaCache integration for historical data loading.
 """
 import os, json, time
 from datetime import datetime, timedelta
@@ -20,13 +21,11 @@ class BacktestEngine:
         self.gap_cfg = cfg.get("gap_predictor", {})
         self.ml_cfg = cfg.get("ml_forecast", {})
 
-        # Walk-forward params from config
         self.walk_splits = self.cfg.get("walk_forward_splits", 5)
         self.train_size = self.cfg.get("train_size", 0.7)
         self.metrics_list = self.cfg.get("metrics", ["accuracy", "precision", "recall", "sharpe", "max_drawdown", "win_rate"])
         self.regime_filter = self.cfg.get("regime_filter", True)
 
-        # Transaction costs
         self.tx_cost = 0.00125  # 0.125% per side
         self.slippage = 0.001   # 0.1% slippage
 
@@ -187,8 +186,11 @@ class BacktestEngine:
                 continue
 
             if self.regime_filter:
-                regime = regime_detector.detect(df)
-                position_mult = regime.get("position_size", 1.0)
+                try:
+                    regime = regime_detector.detect(df)
+                    position_mult = regime.get("position_size", 1.0)
+                except Exception:
+                    position_mult = 1.0
             else:
                 position_mult = 1.0
 
