@@ -310,6 +310,16 @@ def fetch_eod(symbol: str, exchange: str = "EGX", period: str = "d", days: int =
 
 
 def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
+    # --- Synthetic data generation constants ---
+    TRADING_DAYS_PER_YEAR = 252
+    DRIFT_MIN = -0.0002
+    DRIFT_MAX = 0.0005
+    RANGE_VOL_MIN = 0.5
+    RANGE_VOL_MAX = 2.0
+    VOL_RANGE_MULTIPLIER = 3
+    VOL_RANDOM_MIN = 0.3
+    VOL_RANDOM_MAX = 3.0
+    # -------------------------------------------
     """Generate realistic synthetic OHLCV data for testing when EODHD is unavailable.
     EGX trades Sun-Thu.
     """
@@ -329,13 +339,13 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
 
     base_price = np.random.uniform(5, 200)
     annual_vol = np.random.uniform(0.20, 0.45)
-    daily_vol = annual_vol / np.sqrt(252)
-    drift = np.random.uniform(-0.0002, 0.0005)
+    daily_vol = annual_vol / np.sqrt(TRADING_DAYS_PER_YEAR)
+    drift = np.random.uniform(DRIFT_MIN, DRIFT_MAX)
 
     returns = np.random.normal(drift, daily_vol, n)
     prices = base_price * np.exp(np.cumsum(returns))
 
-    daily_range = prices * daily_vol * np.random.uniform(0.5, 2.0, n)
+    daily_range = prices * daily_vol * np.random.uniform(RANGE_VOL_MIN, RANGE_VOL_MAX, n)
     high = prices + daily_range * np.random.uniform(0.3, 0.7, n)
     low = prices - daily_range * np.random.uniform(0.3, 0.7, n)
     open_p = prices + np.random.normal(0, daily_vol * prices * 0.3, n)
@@ -344,7 +354,7 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
     low = np.minimum(low, np.minimum(open_p, prices))
 
     base_vol = np.random.uniform(100_000, 5_000_000)
-    volume = base_vol * (1 + 3 * (daily_range / prices)) * np.random.uniform(0.3, 3.0, n)
+    volume = base_vol * (1 + VOL_RANGE_MULTIPLIER * (daily_range / prices.replace(0, np.nan))) * np.random.uniform(VOL_RANDOM_MIN, VOL_RANDOM_MAX, n)
 
     df = pd.DataFrame({
         "date": dates,
@@ -361,6 +371,15 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
 
 
 def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # --- Constants for indicator computation ---
+    PIVOT_DIVISOR = 3
+    FIB_382 = 0.382
+    FIB_500 = 0.500
+    FIB_618 = 0.618
+    EMA_PROXIMITY_PCT = 0.02  # 2% proximity to EMA20
+    T0_LIQUIDITY_BASE = 0.5
+    VOLUME_LIQUIDITY_CAP = 0.5
+    # -------------------------------------------
     df = df.copy()
     close = df["close"]
     high = df["high"]
@@ -417,10 +436,12 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     mfm = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
     mfv = mfm * volume
-    df["cmf_20"] = mfv.rolling(20).sum() / volume.rolling(20).sum()
+    vol_sum_20 = volume.rolling(20).sum()
+    df["cmf_20"] = mfv.rolling(20).sum() / vol_sum_20.replace(0, np.nan)
 
     typical = (high + low + close) / 3
-    df["vwap_20d"] = (typical * volume).rolling(20).sum() / volume.rolling(20).sum()
+    vol_sum_20 = volume.rolling(20).sum()
+    df["vwap_20d"] = (typical * volume).rolling(20).sum() / vol_sum_20.replace(0, np.nan)
 
     avwap_vals = []
     for i in range(len(df)):
@@ -431,7 +452,8 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         swing_idx = (window["low"] * window["volume"]).idxmin()
         anchor_slice = window.loc[swing_idx:]
         t = (anchor_slice["high"] + anchor_slice["low"] + anchor_slice["close"]) / 3
-        avwap = (t * anchor_slice["volume"]).sum() / anchor_slice["volume"].sum()
+        anchor_vol_sum = anchor_slice["volume"].sum()
+        avwap = (t * anchor_slice["volume"]).sum() / anchor_vol_sum if anchor_vol_sum != 0 else np.nan
         avwap_vals.append(avwap)
     df["anchored_vwap"] = avwap_vals
 
@@ -442,7 +464,7 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_14"] = tr.rolling(14).mean()
 
     prev = df.shift(1)
-    pp = (prev["high"] + prev["low"] + prev["close"]) / 3
+    pp = (prev["high"] + prev["low"] + prev["close"])  / PIVOT_DIVISOR  # classic pivot: (H+L+C)/3
     df["pivot"] = pp
     df["r1"] = 2 * pp - prev["low"]
     df["r2"] = pp + (prev["high"] - prev["low"])
@@ -454,11 +476,12 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d20_high = df["high"].rolling(20).max()
     d20_low = df["low"].rolling(20).min()
     d20_range = d20_high - d20_low
-    df["fib_382"] = d20_low + 0.382 * d20_range
-    df["fib_500"] = d20_low + 0.500 * d20_range
-    df["fib_618"] = d20_low + 0.618 * d20_range
+    df["fib_382"] = d20_low + FIB_382 * d20_range
+    df["fib_500"] = d20_low + FIB_500 * d20_range
+    df["fib_618"] = d20_low + FIB_618 * d20_range
 
-    df["volume_vs_avg20"] = volume / volume.rolling(20).mean()
+    vol_avg_20 = volume.rolling(20).mean()
+    df["volume_vs_avg20"] = volume / vol_avg_20.replace(0, np.nan)
 
     ema50 = df["ema_50"]
     sma200 = df["sma_200"]
@@ -469,7 +492,7 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["gemini_trend_score"] = (ema50 > sma200).astype(float).fillna(0)
     df["gemini_volume_score"] = ((obv_s > obv_s.shift(5)) & (cmf > 0)).astype(float).fillna(0)
-    df["gemini_timing_score"] = (((rsi >= 40) & (rsi <= 50)) & (np.abs(close - ema20) / ema20 < 0.02)).astype(float).fillna(0)
+    df["gemini_timing_score"] = (((rsi >= 40) & (rsi <= 50)) & (np.abs(close - ema20) / ema20.replace(0, np.nan) < EMA_PROXIMITY_PCT)).astype(float).fillna(0)
     df["gemini_composite"] = (df["gemini_trend_score"] + df["gemini_volume_score"] + df["gemini_timing_score"]) / 3
 
     weekly_ema20 = close.ewm(span=20, adjust=False).mean()
@@ -492,7 +515,7 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     segment = get_segment(df.attrs.get("ticker", ""))
     t0_eligible = segment in CONFIG.get("t0_rules", {}).get("t0_enabled_segments", [])
     vol_avg = volume.rolling(20).mean()
-    df["liquidity_score"] = np.where(t0_eligible, 0.5, 0.0) + np.minimum(volume / vol_avg * 0.5, 0.5)
+    df["liquidity_score"] = np.where(t0_eligible, 0.5, 0.0) + np.minimum(volume / vol_avg.replace(0, np.nan) * 0.5, 0.5)
     df["t0_eligible"] = t0_eligible
     df["market_segment"] = segment
 

@@ -392,6 +392,17 @@ def detect_skills(df: pd.DataFrame, weekly_conf: Optional[Dict] = None) -> List[
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def vamp_prediction(df: pd.DataFrame, days: int = 7) -> Optional[Dict]:
+    # --- VAMP Prediction Constants ---
+    W_WEEKLY = 0.15
+    W_VOL = 0.125
+    ATR_NORMALIZATION_BASE = 5.0
+    W_EMA_BASE = 0.55
+    W_EMA_VOL_ADJUST = 0.25
+    W_TREND_BASE = 0.45
+    DAYS_PER_WEEK = 5
+    PCT_DIVISOR = 100
+    MIN_SCORE_DENOM = 0.01
+    # ---------------------------------
     if len(df) < 50:
         return None
     current = float(df["close"].iloc[-1])
@@ -418,14 +429,14 @@ def vamp_prediction(df: pd.DataFrame, days: int = 7) -> Optional[Dict]:
             if not np.isnan(obv_signal):
                 volume_implied = current * (1.0 + np.clip(obv_signal, -1, 1) * 0.20)
 
-    w_weekly = 0.15
+    w_weekly = W_WEEKLY
     w_vol = 0.125
     remaining = 1.0 - w_weekly - w_vol
     atr = float(df["ATR"].iloc[-1]) if "ATR" in df.columns and not df["ATR"].isna().all() else 0.0
     atr_pct = (atr / current * 100) if current else 0
-    vol_ratio = min(atr_pct / 5.0, 1.0)
-    w_ema = remaining * (0.55 + 0.25 * vol_ratio)
-    w_trend = remaining * (0.45 - 0.25 * vol_ratio)
+    vol_ratio = min(atr_pct / ATR_NORMALIZATION_BASE, 1.0)
+    w_ema = remaining * (W_EMA_BASE + W_EMA_VOL_ADJUST * vol_ratio)
+    w_trend = remaining * (W_TREND_BASE - 0.25 * vol_ratio)
 
     weekly_trend = current
     if len(df) >= 100:
@@ -434,7 +445,7 @@ def vamp_prediction(df: pd.DataFrame, days: int = 7) -> Optional[Dict]:
             w_y = weekly.values
             w_x = np.arange(len(w_y)).reshape(-1, 1)
             w_model = LinearRegression().fit(w_x, w_y)
-            weeks_fwd = max(1, round(days / 5))
+            weeks_fwd = max(1, round(days  / DAYS_PER_WEEK))
             weekly_trend = float(w_model.predict([[len(w_y) + weeks_fwd]])[0])
 
     target = (trend_forecast * w_trend) + (ema20 * w_ema) + (volume_implied * w_vol) + (weekly_trend * w_weekly)
@@ -478,11 +489,11 @@ class Portfolio:
     def enter_position(self, ticker: str, date: datetime, price: float,
                        stop: float, target: float, risk_amount: float, shares: int) -> Optional[Trade]:
         exec_price = price * (1 + self.config.slippage_pct / 100)
-        cost = shares * exec_price * (1 + self.config.commission_pct / 100)
+        cost = shares * exec_price * (1 + self.config.commission_pct  / PCT_DIVISOR)
         if cost > self.cash:
             max_shares = int(self.cash / (exec_price * (1 + self.config.commission_pct / 100)))
             shares = min(shares, max_shares)
-            cost = shares * exec_price * (1 + self.config.commission_pct / 100)
+            cost = shares * exec_price * (1 + self.config.commission_pct  / PCT_DIVISOR)
             if shares <= 0:
                 return None
         self.cash -= cost
@@ -497,7 +508,7 @@ class Portfolio:
         trade = self.positions.pop(ticker)
         exec_price = price * (1 - self.config.slippage_pct / 100)
         gross = trade.shares * exec_price
-        commission = gross * (self.config.commission_pct / 100)
+        commission = gross * (self.config.commission_pct  / PCT_DIVISOR)
         net = gross - commission
         self.cash += net
         trade.exit_date = date
@@ -552,7 +563,7 @@ class BacktestEngine:
         for ticker in self.data:
             self.data[ticker] = calculate_indicators(self.data[ticker])
 
-        benchmark_allocation = self.config.capital / len(self.config.universe)
+        benchmark_allocation = self.config.capital / len(self.config.universe) if self.config.universe else 1
         for ticker in self.config.universe:
             if ticker in self.data:
                 price = self.data[ticker]["close"].iloc[0]
@@ -611,7 +622,7 @@ class BacktestEngine:
                         continue
 
                     best_skill = skills[0]
-                    score = best_skill["confidence"] * vamp["growth"] / max(risk_per_share / entry_price * 100, 0.01)
+                    score = best_skill["confidence"] * vamp["growth"] / max(risk_per_share / entry_price * PCT_DIVISOR, MIN_SCORE_DENOM)
                     signals.append({"ticker": ticker, "score": score, "entry": entry_price,
                                     "stop": stop_price, "target": target_price,
                                     "risk_amount": risk_amount, "shares": shares})
@@ -656,8 +667,8 @@ def generate_backtest_report(portfolio, config: BacktestConfig, output_dir: Path
     eq_df.to_csv(eq_path, index=False)
 
     # Performance metrics
-    total_return = (portfolio.equity - config.capital) / config.capital * 100
-    benchmark_return = (portfolio.benchmark_cash - config.capital) / config.capital * 100
+    total_return = (portfolio.equity - config.capital) / config.capital * PCT_DIVISOR if config.capital != 0 else 0
+    benchmark_return = (portfolio.benchmark_cash - config.capital) / config.capital * PCT_DIVISOR if config.capital != 0 else 0
 
     winning_trades = [t for t in portfolio.trades if t.pnl and t.pnl > 0]
     losing_trades = [t for t in portfolio.trades if t.pnl and t.pnl <= 0]
@@ -671,7 +682,7 @@ def generate_backtest_report(portfolio, config: BacktestConfig, output_dir: Path
     for s in portfolio.snapshots:
         if s.equity > peak:
             peak = s.equity
-        dd = (peak - s.equity) / peak * 100
+        dd = (peak - s.equity) / peak * PCT_DIVISOR if peak != 0 else 0
         if dd > max_drawdown:
             max_drawdown = dd
 

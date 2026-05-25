@@ -18,6 +18,10 @@ FLOW_CFG = CONFIG.get("flow_sentiment", {})
 
 
 class EGXFlowScraper:
+    # --- Flow Scraper Constants ---
+    MAX_CONFIDENCE = 1.0
+    RETAIL_FOMO_THRESHOLD = 0.1
+    # ------------------------------
     """Scrape EGX market flow data for sentiment scoring."""
 
     def __init__(self):
@@ -56,9 +60,9 @@ class EGXFlowScraper:
             return {"score": 0, "confidence": 0, "meta": {}}
 
         total = flow_data.get("total_volume", 1)
-        foreign_ratio = (flow_data.get("foreign_buy", 0) + flow_data.get("foreign_sell", 0)) / total
-        inst_ratio = (flow_data.get("institutional_buy", 0) + flow_data.get("institutional_sell", 0)) / total
-        retail_ratio = (flow_data.get("retail_buy", 0) + flow_data.get("retail_sell", 0)) / total
+        foreign_ratio = (flow_data.get("foreign_buy", 0) + flow_data.get("foreign_sell", 0))  / total if total > 0 else 0
+        inst_ratio = (flow_data.get("institutional_buy", 0) + flow_data.get("institutional_sell", 0))  / total if total > 0 else 0
+        retail_ratio = (flow_data.get("retail_buy", 0) + flow_data.get("retail_sell", 0))  / total if total > 0 else 0
 
         net_foreign = flow_data.get("net_foreign", 0)
         net_inst = flow_data.get("net_institutional", 0)
@@ -67,17 +71,17 @@ class EGXFlowScraper:
         # Score components
         score = 0.0
         if net_foreign > 0:
-            score += self.foreign_buy_boost * (net_foreign / total)
+            score += self.foreign_buy_boost * (net_foreign / total if total > 0 else 0)
         else:
-            score += self.foreign_sell_penalty * abs(net_foreign / total)
+            score += self.foreign_sell_penalty * abs(net_foreign / total if total > 0 else 0)
 
         if net_inst > 0:
-            score += self.institutional_ratio_bonus * (net_inst / total)
+            score += self.institutional_ratio_bonus * (net_inst / total if total > 0 else 0)
 
-        if net_retail < 0 and abs(net_retail / total) > 0.1:
+        if net_retail < 0 and abs(net_retail / total if total > 0 else 0) > RETAIL_FOMO_THRESHOLD:
             score += self.retail_fomo_penalty  # retail selling = smart money buying
 
-        confidence = min(1.0, foreign_ratio + inst_ratio)
+        confidence = min(MAX_CONFIDENCE, foreign_ratio + inst_ratio)
 
         return {
             "score": round(np.clip(score, -1, 1), 3),

@@ -132,6 +132,14 @@ class SetupQuality:
 
 class IndicatorEngine:
     """Compute all technical indicators from EOD data."""
+    # --- Technical Analysis Constants ---
+    RSI_MAX = 100
+    EMA_PROXIMITY_PCT = 0.02  # 2% proximity to EMA20
+    GEMINI_COMPONENT_COUNT = 3
+    T0_LIQUIDITY_BASE = 0.5
+    VOLUME_LIQUIDITY_CAP = 0.5
+    SLOPE_LOOKBACK = 5
+    # ------------------------------------
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -167,8 +175,8 @@ class IndicatorEngine:
         avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
         avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
 
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = RSI_MAX - (RSI_MAX / (1 + rs))
         return rsi
 
     def compute_stochastic_rsi(self, rsi_period: int = 14, 
@@ -177,7 +185,7 @@ class IndicatorEngine:
                              d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
         rsi = self.compute_rsi(rsi_period)
 
-        stoch_rsi = (rsi - rsi.rolling(stoch_period).min()) /                     (rsi.rolling(stoch_period).max() - rsi.rolling(stoch_period).min())
+        stoch_rsi = (rsi - rsi.rolling(stoch_period).min()) / (rsi.rolling(stoch_period).max() - rsi.rolling(stoch_period).min()).replace(0, np.nan)
 
         k = stoch_rsi.rolling(k_period).mean() * 100
         d = k.rolling(d_period).mean()
@@ -230,10 +238,11 @@ class IndicatorEngine:
         return pd.Series(obv, index=self.df.index)
 
     def compute_cmf(self, period: int = 20) -> pd.Series:
-        mfm = ((self.df["close"] - self.df["low"]) - (self.df["high"] - self.df["close"])) /               (self.df["high"] - self.df["low"])
+        mfm = ((self.df["close"] - self.df["low"]) - (self.df["high"] - self.df["close"])) / (self.df["high"] - self.df["low"]).replace(0, np.nan)
         mfv = mfm * self.df["volume"]
 
-        cmf = mfv.rolling(window=period).sum() / self.df["volume"].rolling(window=period).sum()
+        vol_sum = self.df["volume"].rolling(window=period).sum()
+        cmf = mfv.rolling(window=period).sum() / vol_sum.replace(0, np.nan)
         return cmf
 
     def compute_vwap(self, period: int = 20) -> pd.Series:
@@ -241,7 +250,8 @@ class IndicatorEngine:
         typical = (self.df["high"] + self.df["low"] + self.df["close"]) / 3
         tp_vol = typical * self.df["volume"]
 
-        vwap = tp_vol.rolling(window=period).sum() / self.df["volume"].rolling(window=period).sum()
+        vol_sum = self.df["volume"].rolling(window=period).sum()
+        vwap = tp_vol.rolling(window=period).sum() / vol_sum.replace(0, np.nan)
         return vwap
 
     def compute_anchored_vwap(self, lookback: int = 60) -> Tuple[pd.Series, pd.Series]:
@@ -268,7 +278,8 @@ class IndicatorEngine:
             typical = (anchor_slice["high"] + anchor_slice["low"] + anchor_slice["close"]) / 3
             tp_vol = typical * anchor_slice["volume"]
 
-            avwap = tp_vol.cumsum().iloc[-1] / anchor_slice["volume"].cumsum().iloc[-1]
+            anchor_vol_cumsum = anchor_slice["volume"].cumsum().iloc[-1]
+            avwap = tp_vol.cumsum().iloc[-1] / anchor_vol_cumsum if anchor_vol_cumsum != 0 else np.nan
             avwap_values.append(avwap)
             anchor_dates.append(anchor_slice["date"].iloc[0] if "date" in anchor_slice.columns else None)
 
@@ -311,7 +322,8 @@ class IndicatorEngine:
         atr = self.compute_atr()
         stop = self.df["close"] - atr * atr_multiplier
         target = self.df["close"] + atr * atr_multiplier * 2  # 1:2 R/R
-        rr = (target - self.df["close"]) / (self.df["close"] - stop)
+        risk = self.df["close"] - stop
+        rr = (target - self.df["close"]) / risk.replace(0, np.nan)
         return stop, target, rr
 
     # --- WEEKLY CONFLUENCE (ported from v3.7) ---
@@ -371,11 +383,11 @@ class IndicatorEngine:
 
         # 3. Timing Score
         rsi_pullback = ((rsi >= 40) & (rsi <= 50)).astype(float)
-        price_near_ema20 = (np.abs(self.df["close"] - ema20) / ema20 < 0.02).astype(float)  # within 2%
+        price_near_ema20 = (np.abs(self.df["close"] - ema20) / ema20.replace(0, np.nan) < EMA_PROXIMITY_PCT).astype(float)  # within 2%
         timing_score = ((rsi_pullback + price_near_ema20) / 2).fillna(0)
 
         # Composite (equal weight)
-        composite = (trend_score + volume_score + timing_score) / 3
+        composite = (trend_score + volume_score + timing_score)  / GEMINI_COMPONENT_COUNT
 
         return trend_score, volume_score, timing_score, composite
 
@@ -394,7 +406,7 @@ class IndicatorEngine:
         vol_ratio = self.df["volume"] / vol_avg
 
         # Liquidity score: T+0 gets boost, high volume gets boost
-        liquidity = np.where(t0_eligible, 0.5, 0.0) + np.minimum(vol_ratio * 0.5, 0.5)
+        liquidity = np.where(t0_eligible, T0_LIQUIDITY_BASE, 0.0)  # T+1 gets no base boost + np.minimum(vol_ratio * VOLUME_LIQUIDITY_CAP, 0.5)
         liquidity = pd.Series(liquidity, index=self.df.index).fillna(0)
 
         return pd.Series([t0_eligible] * len(self.df), index=self.df.index),                pd.Series([market_segment] * len(self.df), index=self.df.index),                liquidity
@@ -415,8 +427,8 @@ class IndicatorEngine:
         ema20 = self.compute_ema(20).iloc[i]
         ema50 = self.compute_ema(50).iloc[i]
         sma200 = self.compute_sma(200).iloc[i]
-        ema20_slope = (self.compute_ema(20).iloc[i] - self.compute_ema(20).iloc[i-5]) / 5
-        ema50_slope = (self.compute_ema(50).iloc[i] - self.compute_ema(50).iloc[i-5]) / 5
+        ema20_slope = (self.compute_ema(20).iloc[i] - self.compute_ema(20).iloc[i-SLOPE_LOOKBACK])  / SLOPE_LOOKBACK
+        ema50_slope = (self.compute_ema(50).iloc[i] - self.compute_ema(50).iloc[i-SLOPE_LOOKBACK])  / SLOPE_LOOKBACK
         trend_dir = self.compute_trend_direction().iloc[i]
 
         # Momentum

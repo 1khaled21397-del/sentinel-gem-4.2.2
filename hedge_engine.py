@@ -26,7 +26,7 @@ class EGXHedgeEngine:
         var = aligned.iloc[:, 1].var()
         if var == 0 or np.isnan(var):
             return 1.0
-        return float(cov / var)
+        return float(cov / var) if var != 0 else 1.0
 
     def compute_hedge(self, portfolio: List[Dict], index_df: pd.DataFrame) -> Dict:
         """

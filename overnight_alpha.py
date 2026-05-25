@@ -17,6 +17,13 @@ with open("sentinel_config.json", "r", encoding="utf-8") as f:
 
 ALPHA_CFG = CONFIG.get("alpha_scorer", {})
 ALPHA_WEIGHTS = ALPHA_CFG.get("weights", {})
+# --- Alpha Scorer Constants ---
+ML_RETURN_MULTIPLIER = 5
+MIN_RR_FOR_BONUS = 2.0
+CONFLICT_PENALTY = 0.7
+SHOCK_PENALTY = 0.5
+BEAR_PENALTY = 0.6
+# ------------------------------
 MIN_ALPHA = ALPHA_CFG.get("min_alpha_to_report", 0.55)
 TOP_N = ALPHA_CFG.get("top_n_setups", 10)
 
@@ -188,7 +195,7 @@ class OvernightAlphaPipeline:
 
         # ML
         if ml and ml.get("target_return", 0) > 0:
-            score += ALPHA_WEIGHTS.get("ml_7d", 0.15) * ml["target_return"] * 5
+            score += ALPHA_WEIGHTS.get("ml_7d", 0.15) * ml["target_return"] * ML_RETURN_MULTIPLIER
             score += ALPHA_WEIGHTS.get("ml_7d", 0.15) * ml.get("confidence", 0)
 
         # Sentiment
@@ -209,17 +216,17 @@ class OvernightAlphaPipeline:
         # S/R bonus
         if setup.get("entry_zone") and setup.get("stop_loss"):
             rr = setup.get("rr", 0)
-            if rr >= 2.0:
+            if rr >= MIN_RR_FOR_BONUS:
                 score += ALPHA_WEIGHTS.get("sr_bonus", 0.05)
 
         # Regime penalty/bonus
         if regime:
             if regime.get("conflict_flag"):
-                score *= 0.7
+                score *= CONFLICT_PENALTY
             if regime.get("shock_detected"):
-                score *= 0.5
+                score *= SHOCK_PENALTY
             if "bear" in regime.get("regime", ""):
-                score *= 0.6
+                score *= BEAR_PENALTY
 
         return min(1.0, max(0.0, score))
 

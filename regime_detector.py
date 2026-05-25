@@ -40,7 +40,7 @@ def detect_regime(df: pd.DataFrame) -> Dict:
     # Trend: slope of 50-day linear regression
     x = np.arange(len(close))
     slope = np.polyfit(x[-50:], close.iloc[-50:].values, 1)[0]
-    slope_pct = slope / close.iloc[-1] * 100
+    slope_pct = slope / close.iloc[-1] if close.iloc[-1] != 0 else 0 * 100
 
     # Volatility regime
     vol_20 = returns.iloc[-20:].std() * np.sqrt(252)
@@ -49,14 +49,14 @@ def detect_regime(df: pd.DataFrame) -> Dict:
 
     # ADX proxy using price range
     high_low = (df["high"] - df["low"]) / df["close"]
-    adx_proxy = high_low.iloc[-14:].mean() * 100
+    adx_proxy = high_low.iloc[-14:].mean() * ADX_PROXY_MULTIPLIER
 
     # RSI
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
+    rsi = RSI_MAX - (RSI_MAX / (1 + rs))
     latest_rsi = rsi.iloc[-1] if not rsi.empty else 50
 
     # Scoring
@@ -89,7 +89,7 @@ def detect_regime(df: pd.DataFrame) -> Dict:
         regime = "sideways"
         position_size = 0.6
 
-    confidence = min(1.0, abs(total_score) / 3.0 + 0.3)
+    confidence = min(1.0, abs(total_score) / MAX_REGIME_SCORE + CONFIDENCE_BASE)
 
     return {
         "regime": regime,
@@ -241,7 +241,7 @@ class HeuristicRegimeDetector:
         # Trend
         x = np.arange(len(close))
         slope = np.polyfit(x[-50:], close.iloc[-50:].values, 1)[0]
-        slope_pct = slope / close.iloc[-1] * 100
+        slope_pct = slope / close.iloc[-1] if close.iloc[-1] != 0 else 0 * 100
 
         # Volatility
         vol_20 = returns.iloc[-20:].std() * np.sqrt(252)
@@ -250,14 +250,14 @@ class HeuristicRegimeDetector:
 
         # ADX proxy
         high_low = (df["high"] - df["low"]) / df["close"]
-        adx_proxy = high_low.iloc[-14:].mean() * 100
+        adx_proxy = high_low.iloc[-14:].mean() * ADX_PROXY_MULTIPLIER
 
         # RSI
         delta = close.diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
+        rsi = RSI_MAX - (RSI_MAX / (1 + rs))
         latest_rsi = rsi.iloc[-1] if not rsi.empty else 50
 
         # Shock detection
@@ -311,7 +311,7 @@ class HeuristicRegimeDetector:
         if t0_spike and position_size > 0.5:
             position_size *= 0.7
 
-        confidence = min(1.0, abs(total_score) / 3.0 + 0.3)
+        confidence = min(1.0, abs(total_score) / MAX_REGIME_SCORE + CONFIDENCE_BASE)
         if shock_detected:
             confidence *= 0.6
 
@@ -347,7 +347,7 @@ class HeuristicRegimeDetector:
 
         if len(df) >= 3:
             last3 = df["close"].iloc[-3:].pct_change().dropna()
-            if len(last3) >= 2 and all(last3 < -0.05):
+            if len(last3) >= 2 and all(last3 < CONSECUTIVE_DROP_THRESHOLD):
                 return True, "consecutive_limit_down"
 
         return False, None
@@ -359,7 +359,7 @@ class HeuristicRegimeDetector:
         vol_avg = df["volume"].rolling(20).mean().iloc[-1]
         latest_vol = df["volume"].iloc[-1]
         latest_range = (df["high"].iloc[-1] - df["low"].iloc[-1]) / df["close"].iloc[-1]
-        return latest_vol > vol_avg * th["t0_vol_spike_mult"] and latest_range > 0.05
+        return latest_vol > vol_avg * th["t0_vol_spike_mult"] and latest_range > T0_RANGE_THRESHOLD
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -479,7 +479,7 @@ class HybridRegimeEnsemble:
         self.macro = macro_analyzer or MacroRegimeAnalyzer()
         self.heuristic_weight = 0.6
         self.macro_weight = 0.4
-        self.disagreement_threshold = 1.0
+        self.disagreement_threshold = DISAGREEMENT_THRESHOLD
 
     def detect(self, df: pd.DataFrame, ticker: str = "", segment: str = "",
                headlines: List[str] = None, market_summary: str = "") -> HybridRegimeResult:
@@ -497,8 +497,8 @@ class HybridRegimeEnsemble:
         conflict = disagreement > self.disagreement_threshold
 
         if conflict:
-            blended_score = h_score * 0.7 + m_score * 0.3
-            confidence = min(h.confidence, m.confidence) * 0.5
+            blended_score = h_score * CONFLICT_HEURISTIC_WEIGHT + m_score * CONFLICT_MACRO_WEIGHT
+            confidence = min(h.confidence, m.confidence) * CONFLICT_CONFIDENCE_PENALTY
         else:
             blended_score = h_score * self.heuristic_weight + m_score * self.macro_weight
             confidence = (h.confidence + m.confidence) / 2
@@ -514,11 +514,11 @@ class HybridRegimeEnsemble:
             position_size = MULTIPLIERS.get("sideways", 0.6)
 
         if m.risk_off_flag and position_size > 0.4:
-            position_size *= 0.6
+            position_size *= RISK_OFF_MULTIPLIER
             regime = f"{regime}_risk_off"
 
         if h.shock_detected:
-            position_size *= 0.5
+            position_size *= SHOCK_MULTIPLIER
             regime = f"{regime}_shock"
 
         if conflict:

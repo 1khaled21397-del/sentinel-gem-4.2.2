@@ -13,6 +13,16 @@ from datetime import datetime, timedelta
 import json, os, sqlite3
 from pathlib import Path
 import tempfile
+# --- UI Constants ---
+DEFAULT_MIN_ALPHA = 0.55
+ALPHA_STEP = 0.05
+TOP_N_MIN = 1
+TOP_N_MAX = 20
+TOP_N_DEFAULT = 10
+CHART_HEIGHT = 500
+HEADLINES_TEXTAREA_HEIGHT = 80
+DATE_SLICE_LENGTH = 10
+# --------------------
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -240,8 +250,8 @@ with st.sidebar:
         st.write(f"{'🟢' if ok else '🔴'} {mod}")
 
     st.subheader("📊 Settings")
-    min_alpha = st.slider("Min Alpha Score", 0.0, 1.0, 0.55, 0.05)
-    top_n = st.slider("Top N Setups", 1, 20, 10)
+    min_alpha = st.slider("Min Alpha Score", 0.0, 1.0, DEFAULT_MIN_ALPHA, ALPHA_STEP)
+    top_n = st.slider("Top N Setups", TOP_N_MIN, TOP_N_MAX, TOP_N_DEFAULT)
 
     st.subheader("🔥 T+0 Filter")
     t0_only = st.checkbox("T+0 Eligible Only", value=False)
@@ -279,7 +289,7 @@ with tab1:
 
         results = []
         for i, ticker in enumerate(selected_tickers):
-            progress.progress((i + 1) / len(selected_tickers))
+            progress.progress((i + 1) / len(selected_tickers) if selected_tickers else 0)
             status.text(f"Analyzing {ticker}... ({i+1}/{len(selected_tickers)})")
 
             try:
@@ -473,7 +483,7 @@ with tab2:
                         fig.add_trace(go.Scatter(x=df["date"], y=df["sma_200"], mode="lines", name="SMA200"))
                     if "vwap_20d" in df.columns:
                         fig.add_trace(go.Scatter(x=df["date"], y=df["vwap_20d"], mode="lines", name="VWAP"))
-                    fig.update_layout(template="plotly_dark", height=500)
+                    fig.update_layout(template="plotly_dark", height=CHART_HEIGHT)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.error("data_engine module not available")
@@ -716,7 +726,7 @@ with tab5:
                         # Paper trading log
                         st.subheader("📝 Paper Trading Log Entry")
                         log_entry = f"""
-Date: {hybrid.timestamp[:10]}
+Date: {hybrid.timestamp[:DATE_SLICE_LENGTH]}
 Ticker: {regime_ticker}
 Regime: {hybrid.regime}
 Heuristic: {h.regime} | Macro: {m.macro_score:+.2f}
@@ -767,7 +777,7 @@ Outcome:
                 segments[ticker] = get_segment(ticker)
             except Exception as e:
                 st.warning(f"Skipping {ticker}: {e}")
-            train_progress.progress((idx + 1) / total)
+            train_progress.progress((idx + 1) / total if total > 0 else 0)
 
         if len(historical_data) >= 3:
             train_status.text("Training model...")

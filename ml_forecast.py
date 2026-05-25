@@ -43,6 +43,19 @@ class MLForecastEngine:
         self.feature_cols = FEATURES
 
     def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        # --- Feature engineering constants ---
+        RSI_NORMALIZER = 100
+        TRAIN_SPLIT_RATIO = 0.8
+        EPSILON = 1e-3
+        # XGBoost hyperparameters
+        XGB_N_ESTIMATORS = 200
+        XGB_MAX_DEPTH = 5
+        XGB_LEARNING_RATE = 0.1
+        # Random Forest hyperparameters
+        RF_N_ESTIMATORS = 200
+        RF_MAX_DEPTH = 5
+        RANDOM_STATE = 42
+        # -------------------------------------
         """Build ML forecast features from indicator-enriched dataframe."""
         feat = pd.DataFrame(index=df.index)
         close = df["close"]
@@ -58,26 +71,26 @@ class MLForecastEngine:
         feat["ema20"] = df.get("ema_20", close)
         feat["ema50"] = df.get("ema_50", close)
         feat["sma200"] = df.get("sma_200", close)
-        feat["ema_distance"] = (df.get("ema_20", close) - df.get("ema_50", close)) / close
+        feat["ema_distance"] = (df.get("ema_20", close) - df.get("ema_50", close))  / close.replace(0, np.nan)
 
         # RSI
-        feat["rsi_14"] = df.get("rsi_14", 50) / 100
-        feat["stoch_rsi_k"] = df.get("stoch_rsi_k", 50) / 100
-        feat["stoch_rsi_d"] = df.get("stoch_rsi_d", 50) / 100
+        feat["rsi_14"] = df.get("rsi_14", 50)  / RSI_NORMALIZER
+        feat["stoch_rsi_k"] = df.get("stoch_rsi_k", 50)  / RSI_NORMALIZER
+        feat["stoch_rsi_d"] = df.get("stoch_rsi_d", 50)  / RSI_NORMALIZER
 
         # MACD
-        feat["macd_hist"] = df.get("macd_hist", 0) / close
-        feat["macd_signal"] = df.get("macd_signal", 0) / close
+        feat["macd_hist"] = df.get("macd_hist", 0)  / close.replace(0, np.nan)
+        feat["macd_signal"] = df.get("macd_signal", 0)  / close.replace(0, np.nan)
 
         # Volume
         feat["cmf_20"] = df.get("cmf_20", 0)
         feat["obv_slope_5d"] = df.get("obv_slope_5d", 0)
         feat["volume_vs_avg20"] = df.get("volume_vs_avg20", 1)
-        feat["vwap_distance"] = (close - df.get("vwap_20d", close)) / close
-        feat["anchored_vwap_distance"] = (close - df.get("anchored_vwap", close)) / close
+        feat["vwap_distance"] = (close - df.get("vwap_20d", close))  / close.replace(0, np.nan)
+        feat["anchored_vwap_distance"] = (close - df.get("anchored_vwap", close))  / close.replace(0, np.nan)
 
         # Volatility
-        feat["atr_14"] = df.get("atr_14", close * 0.02) / close
+        feat["atr_14"] = df.get("atr_14", close * 0.02)  / close.replace(0, np.nan)
         feat["volatility_20d"] = close.pct_change().rolling(20).std() * np.sqrt(252)
 
         # Gemini
@@ -92,6 +105,8 @@ class MLForecastEngine:
     def train(self, df: pd.DataFrame) -> Dict:
         """Train ML models on historical data."""
         try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.pipeline import Pipeline
             from xgboost import XGBRegressor
             from sklearn.ensemble import RandomForestRegressor
         except ImportError:
@@ -111,18 +126,31 @@ class MLForecastEngine:
         X = feat.loc[valid].values
         y = target.loc[valid].values
 
-        split = int(len(X) * 0.8)
+        split = int(len(X) * TRAIN_SPLIT_RATIO)
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
         self.xgb_model = XGBRegressor(
-            n_estimators=200, max_depth=5, learning_rate=0.1,
+            n_estimators=XGB_N_ESTIMATORS, max_depth=XGB_MAX_DEPTH, learning_rate=XGB_LEARNING_RATE,
             subsample=0.8, colsample_bytree=0.8, random_state=42
         )
-        self.xgb_model.fit(X_train, y_train)
+        # Build pipelines with StandardScaler
+        self.xgb_pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", self.xgb_model)
+        ])
+        self.rf_pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", self.rf_model)
+        ])
+        self.xgb_pipeline.fit(X_train, y_train)
+        self.rf_pipeline.fit(X_train, y_train)
+        # Store pipelines as primary models
+        self.xgb_model = self.xgb_pipeline
+        self.rf_model = self.rf_pipeline
 
         self.rf_model = RandomForestRegressor(
-            n_estimators=200, max_depth=5, random_state=42
+            n_estimators=RF_N_ESTIMATORS, max_depth=RF_MAX_DEPTH, random_state=RANDOM_STATE
         )
         self.rf_model.fit(X_train, y_train)
 
@@ -164,7 +192,7 @@ class MLForecastEngine:
         ensemble = xgb_pred * WEIGHTS.get("xgboost", 0.6) + rf_pred * WEIGHTS.get("random_forest", 0.4)
 
         # Confidence based on model agreement
-        agreement = 1 - abs(xgb_pred - rf_pred) / (abs(ensemble) + 0.001)
+        agreement = 1 - abs(xgb_pred - rf_pred) / (abs(ensemble) + EPSILON)
         confidence = min(0.95, max(0.3, agreement))
 
         return {
@@ -179,7 +207,7 @@ class MLForecastEngine:
     def save(self, path: str):
         import pickle
         with open(path, "wb") as f:
-            pickle.dump({"xgb": self.xgb_model, "rf": self.rf_model}, f)
+            pickle.dump({"xgb": self.xgb_pipeline if hasattr(self, "xgb_pipeline") else self.xgb_model, "rf": self.rf_pipeline if hasattr(self, "rf_pipeline") else self.rf_model}, f)
 
     def load(self, path: str):
         import pickle

@@ -43,6 +43,13 @@ class GapPredictor:
         self.t0_boost = T0_BOOST
 
     def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        # --- Feature engineering constants ---
+        RSI_NORMALIZER = 100
+        TRAIN_SPLIT_RATIO = 0.8
+        MAX_HEURISTIC_PROB = 0.8
+        VOL_TO_PROB_MULTIPLIER = 10
+        MAGNITUDE_VOL_MULTIPLIER = 2
+        # -------------------------------------
         """Build 35 gap prediction features from indicator-enriched dataframe."""
         feat = pd.DataFrame(index=df.index)
         close = df["close"]
@@ -64,19 +71,19 @@ class GapPredictor:
         # Price position
         high20 = df["high"].rolling(20).max()
         low20 = df["low"].rolling(20).min()
-        feat["price_vs_high_20d"] = (close - high20) / high20
-        feat["price_vs_low_20d"] = (close - low20) / low20
+        feat["price_vs_high_20d"] = (close - high20)  / high20.replace(0, np.nan)
+        feat["price_vs_low_20d"] = (close - low20)  / low20.replace(0, np.nan)
 
         # ATR
-        feat["atr_ratio"] = df.get("atr_14", close * 0.02) / close
+        feat["atr_ratio"] = df.get("atr_14", close * 0.02)  / close.replace(0, np.nan)
 
         # S/R distance
-        feat["dist_to_r1"] = (df.get("r1", close) - close) / close
-        feat["dist_to_s1"] = (close - df.get("s1", close)) / close
+        feat["dist_to_r1"] = (df.get("r1", close) - close)  / close.replace(0, np.nan)
+        feat["dist_to_s1"] = (close - df.get("s1", close))  / close.replace(0, np.nan)
 
         # EMA slopes
-        feat["ema20_slope"] = df["ema_20"].diff(5) / df["ema_20"].shift(5)
-        feat["ema50_slope"] = df["ema_50"].diff(5) / df["ema_50"].shift(5)
+        feat["ema20_slope"] = df["ema_20"].diff(5) / df["ema_20"].shift(5).replace(0, np.nan)
+        feat["ema50_slope"] = df["ema_50"].diff(5) / df["ema_50"].shift(5).replace(0, np.nan)
 
         # Sentiment placeholder
         feat["sentiment_score"] = 0.0
@@ -88,8 +95,8 @@ class GapPredictor:
         feat["gap_frequency"] = (gaps.abs() > self.threshold).rolling(20).mean()
 
         # VWAP/AVWAP
-        feat["dist_to_vwap"] = (close - df.get("vwap_20d", close)) / close
-        feat["dist_to_avwap"] = (close - df.get("anchored_vwap", close)) / close
+        feat["dist_to_vwap"] = (close - df.get("vwap_20d", close))  / close.replace(0, np.nan)
+        feat["dist_to_avwap"] = (close - df.get("anchored_vwap", close))  / close.replace(0, np.nan)
 
         # CMF/OBV
         feat["cmf_level"] = df.get("cmf_20", 0)
@@ -97,15 +104,15 @@ class GapPredictor:
         feat["obv_slope"] = df.get("obv", 0).diff(5)
 
         # RSI
-        feat["rsi_level"] = df.get("rsi_14", 50) / 100
+        feat["rsi_level"] = df.get("rsi_14", 50)  / RSI_NORMALIZER
         feat["rsi_trend"] = df.get("rsi_14", 50).diff(5)
 
         # StochRSI
-        feat["stochrsi_k"] = df.get("stoch_rsi_k", 50) / 100
-        feat["stochrsi_d"] = df.get("stoch_rsi_d", 50) / 100
+        feat["stochrsi_k"] = df.get("stoch_rsi_k", 50)  / RSI_NORMALIZER
+        feat["stochrsi_d"] = df.get("stoch_rsi_d", 50)  / RSI_NORMALIZER
 
         # MACD
-        feat["macd_hist"] = df.get("macd_hist", 0) / close
+        feat["macd_hist"] = df.get("macd_hist", 0)  / close.replace(0, np.nan)
         feat["macd_bull"] = (df.get("macd_state", "neutral") == "bullish").astype(float)
         feat["macd_bear"] = (df.get("macd_state", "neutral") == "bearish").astype(float)
 
@@ -125,6 +132,8 @@ class GapPredictor:
     def train(self, historical_data: Dict[str, pd.DataFrame], segments: Dict[str, str]) -> Tuple['GapPredictor', Dict]:
         """Train gap prediction model on historical EOD data."""
         try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.pipeline import Pipeline
             from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         except ImportError:
             print("[GapPredictor] sklearn not installed. Using heuristic mode.")
@@ -157,7 +166,7 @@ class GapPredictor:
         y = np.concatenate(y_list)
 
         # Train/test split
-        split = int(len(X) * 0.8)
+        split = int(len(X) * TRAIN_SPLIT_RATIO)
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
@@ -168,7 +177,13 @@ class GapPredictor:
             min_samples_split=TRAIN_CFG.get("min_samples", 100),
             random_state=42
         )
-        self.model.fit(X_train, y_train)
+        # Build pipeline with StandardScaler + GradientBoosting
+        self.pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", self.model)
+        ])
+        self.pipeline.fit(X_train, y_train)
+        self.model = self.pipeline  # Unified interface
         self.is_trained = True
 
         accuracy = self.model.score(X_test, y_test)
@@ -189,9 +204,9 @@ class GapPredictor:
             # Heuristic fallback
             recent_vol = df["close"].pct_change().rolling(5).std().iloc[-1]
             recent_return = df["close"].pct_change(1).iloc[-1]
-            prob = min(0.8, recent_vol * 10)
+            prob = min(MAX_HEURISTIC_PROB, recent_vol * VOL_TO_PROB_MULTIPLIER)
             direction = "up" if recent_return > 0 else "down" if recent_return < 0 else "neutral"
-            magnitude = recent_vol * 2
+            magnitude = recent_vol * MAGNITUDE_VOL_MULTIPLIER
 
             t0 = segment in CONFIG.get("t0_rules", {}).get("t0_enabled_segments", [])
             boost = self.t0_boost if t0 else 1.0
@@ -235,13 +250,16 @@ class GapPredictor:
         """Save trained model."""
         import pickle
         with open(path, "wb") as f:
-            pickle.dump(self.model, f)
+            pickle.dump(self.pipeline if hasattr(self, "pipeline") else self.model, f)
 
     def load(self, path: str):
         """Load trained model."""
         import pickle
         with open(path, "rb") as f:
-            self.model = pickle.load(f)
+            loaded = pickle.load(f)
+
+            self.pipeline = loaded
+            self.model = self.pipeline
         self.is_trained = True
 
 

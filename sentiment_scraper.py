@@ -29,6 +29,13 @@ BEARISH_KEYWORDS = [
     "foreign selling", "margin call", "stop loss", "resistance", "distribution"
 ]
 
+# --- Sentiment Scraper Constants ---
+MAX_CONFIDENCE = 1.0
+SENTIMENT_CONFIDENCE_DIVISOR = 10.0
+KEYWORD_CONFIDENCE_DIVISOR = 20.0
+AI_SCORE_WEIGHT = 0.7
+KEYWORD_SCORE_WEIGHT = 0.3
+# -----------------------------------
 NEUTRAL_KEYWORDS = [
     "maintain", "hold", "stable", "flat", "sideways", "consolidation", "await",
     "pending", "review", "monitor", "neutral", "mixed", "uncertain", "cautious"
@@ -96,8 +103,8 @@ def score_text(text: str) -> Dict:
     if total == 0:
         return {"score": 0.0, "confidence": 0.0, "bull": 0, "bear": 0, "neut": 0}
 
-    raw_score = (bull - bear) / total
-    confidence = min(1.0, total / 10.0)
+    raw_score = (bull - bear) / total if total > 0 else 0.0
+    confidence = min(MAX_CONFIDENCE, total / SENTIMENT_CONFIDENCE_DIVISOR)
 
     return {
         "score": raw_score,
@@ -317,11 +324,11 @@ def batch_sentiment(tickers: List[str], texts: Dict[str, List[str]] = None) -> D
             total_neut += s["neut"]
 
         avg_score = sum(scores) / len(scores) if scores else 0.0
-        keyword_confidence = min(1.0, len(ticker_texts) / 20.0)
+        keyword_confidence = min(MAX_CONFIDENCE, len(ticker_texts) / KEYWORD_CONFIDENCE_DIVISOR)
 
         # Blend AI + keyword if AI available
         if ai_sentiment:
-            blended_score = ai_sentiment["score"] * 0.7 + avg_score * 0.3
+            blended_score = ai_sentiment["score"] * AI_SCORE_WEIGHT + avg_score * KEYWORD_SCORE_WEIGHT
             blended_conf = max(ai_sentiment["confidence"], keyword_confidence)
             summary = ai_sentiment["summary"]
             ai_source = ai_sentiment.get("source")
