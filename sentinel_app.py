@@ -19,7 +19,12 @@ from datetime import datetime, timedelta
 import json, os, sqlite3
 from pathlib import Path
 import tempfile
-import anthropic                          # ← NEW: SDK client for reports module
+try:
+    import anthropic as _anthropic        # SDK client for sentinel_reports (PDF/image parsing)
+    _ANTHROPIC_SDK = True
+except ImportError:
+    _anthropic = None
+    _ANTHROPIC_SDK = False
 
 # --- UI Constants ---
 DEFAULT_MIN_ALPHA       = 0.55
@@ -91,12 +96,15 @@ os.environ["KIMI_API_KEY"]      = KIMI_API_KEY
 os.environ["GEMINI_API_KEY"]    = GEMINI_API_KEY
 
 # ── ANTHROPIC SDK CLIENT (used by sentinel_reports for PDF / image parsing) ──
-claude_client: anthropic.Anthropic | None = None
-if ANTHROPIC_API_KEY:
+claude_client = None
+if ANTHROPIC_API_KEY and _ANTHROPIC_SDK:
     try:
-        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        claude_client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     except Exception:
-        claude_client = None
+        pass
+if not _ANTHROPIC_SDK:
+    st.sidebar.warning("⚠️ anthropic package not installed — Reports PDF/image parsing disabled. "
+                       "Add `anthropic>=0.30.0` to requirements.txt.")
 
 # ── VALIDATE KEYS ──
 missing = []
