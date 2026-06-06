@@ -291,7 +291,7 @@ def get_active_signal(symbol: str) -> Optional[Dict]:
 def get_all_active_signals() -> pd.DataFrame:
     today = datetime.now().strftime("%Y-%m-%d")
     conn  = _db()
-    df = pd.read_sql_query("""
+    cur = conn.execute("""
         SELECT s.symbol, s.action, s.entry_low, s.entry_high,
                s.target1, s.target2, s.stop_loss,
                s.confidence, s.timeframe, s.notes,
@@ -301,22 +301,26 @@ def get_all_active_signals() -> pd.DataFrame:
         JOIN reports r ON s.report_id = r.id
         WHERE s.valid_until >= ?
         ORDER BY s.created_at DESC
-    """, conn, params=(today,))
+    """, (today,))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
 def get_reports_history(limit: int = 20) -> pd.DataFrame:
     conn = _db()
-    df = pd.read_sql_query("""
+    cur = conn.execute("""
         SELECT r.id, r.filename, r.file_type,
                COUNT(s.id) as signals_count,
                r.uploaded_at
         FROM reports r
         LEFT JOIN analyst_signals s ON s.report_id = r.id
         GROUP BY r.id ORDER BY r.uploaded_at DESC LIMIT ?
-    """, (limit,), conn)
+    """, (limit,))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
 # ===========================================================================
 # 5. VAMP CONFIDENCE ADJUSTMENT
@@ -440,7 +444,7 @@ def render_tab(claude_client=None):
                     "Notes": (s.get("notes","") or "")[:60],
                 })
             st.dataframe(pd.DataFrame(preview_rows),
-                         use_container_width=True, hide_index=True)
+                         hide_index=True, width="stretch")
 
             if st.button("💾 حفظ التوصيات", type="secondary"):
                 report_id = store_report_signals(uploaded.name, file_ext, parsed, file_bytes)
@@ -463,7 +467,7 @@ def render_tab(claude_client=None):
             return colors.get(val,"")
 
         styled = active_df.style.map(color_action, subset=["action"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, hide_index=True, width="stretch")
 
         # Conflict check مع VAMP
         st.caption(f"⏳ التوصيات صالحة لـ {SIGNAL_TTL_DAYS} يوم من تاريخ الرفع")
@@ -476,7 +480,7 @@ def render_tab(claude_client=None):
     st.subheader("📁 سجل التقارير")
     hist_df = get_reports_history(20)
     if not hist_df.empty:
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+        st.dataframe(hist_df, hide_index=True, width="stretch")
     else:
         st.info("لا يوجد تقارير محفوظة بعد.")
 
