@@ -768,7 +768,7 @@ def run_daily_if_needed(api_client=None, force: bool = False) -> Dict:
 
 def get_learning_stats() -> pd.DataFrame:
     conn = _db()
-    df = pd.read_sql_query("""
+    cur = conn.execute("""
         SELECT regime, model_type,
                COUNT(*) AS total,
                SUM(outcome_price IS NOT NULL) AS completed,
@@ -776,13 +776,15 @@ def get_learning_stats() -> pd.DataFrame:
                ROUND(AVG(CASE WHEN outcome_price IS NOT NULL THEN ABS(error_pct) END),2) AS mae,
                ROUND(AVG(CASE WHEN outcome_price IS NOT NULL THEN error_pct END),2) AS bias
         FROM forecast_log GROUP BY regime, model_type ORDER BY dir_acc_pct DESC
-    """, conn)
+    """)
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
 def get_recent_forecasts(limit: int = 25) -> pd.DataFrame:
     conn = _db()
-    df = pd.read_sql_query("""
+    cur = conn.execute("""
         SELECT symbol, forecast_date, horizon_days, model_type, regime,
                ROUND(entry_price,2) entry, ROUND(target_price,2) target,
                ROUND(predicted_growth,2) pred_pct,
@@ -791,22 +793,26 @@ def get_recent_forecasts(limit: int = 25) -> pd.DataFrame:
                CASE direction_ok WHEN 1 THEN 'ok' ELSE 'wrong' END direction
         FROM forecast_log WHERE outcome_price IS NOT NULL
         ORDER BY created_at DESC LIMIT ?
-    """, (limit,), conn)
+    """, (limit,))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
 def get_change_history(limit: int = 20) -> pd.DataFrame:
     conn = _db()
-    df = pd.read_sql_query("""
+    cur = conn.execute("""
         SELECT regime, model_type, to_version version, culprit_component culprit,
                change_reason changes, samples_used samples,
                ROUND(rmse_before,3) rmse_before, ROUND(rmse_after,3) rmse_after,
                CASE rolled_back WHEN 1 THEN 'Rolled Back' ELSE 'Active' END status,
                SUBSTR(applied_at,1,10) date
         FROM config_changes ORDER BY applied_at DESC LIMIT ?
-    """, (limit,), conn)
+    """, (limit,))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
 def reset_regime(regime: str, model_type: str):
     loaded = _load_regime_cfgs()
@@ -894,9 +900,9 @@ def render_tab(api_client=None):
         fig.update_layout(template="plotly_dark", height=360, barmode="group",
                           paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
                           font=dict(color="#e2e8f0"), margin=dict(t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)  # noqa: deprecated but safe
         with st.expander("📋 Performance Table"):
-            st.dataframe(stats_df, use_container_width=True, hide_index=True)
+            st.dataframe(stats_df, hide_index=True, width="stretch")
     else:
         st.info("No data yet. Run forecasts and wait for horizon expiry.")
 
@@ -930,8 +936,8 @@ def render_tab(api_client=None):
                         rows_data.append({"Parameter": k, "Default": default.get(k,"—"),
                                           "Active": active.get(k,"—"),
                                           "Changed": "✏️" if k in changed_keys else ""})
-                    st.dataframe(pd.DataFrame(rows_data), use_container_width=True,
-                                 hide_index=True, height=270)
+                    st.dataframe(pd.DataFrame(rows_data),
+                                 hide_index=True, height=270, width="stretch")
                     if st.button(f"↩️ Reset {model}", key=f"rst_{regime}_{model}"):
                         reset_regime(regime, model)
                         st.success("Reset to defaults!")
@@ -941,14 +947,14 @@ def render_tab(api_client=None):
     st.subheader("📈 Change History")
     chg_df = get_change_history(20)
     if not chg_df.empty:
-        st.dataframe(chg_df, use_container_width=True, hide_index=True)
+        st.dataframe(chg_df, hide_index=True, width="stretch")
     else:
         st.info("No changes yet — adjustments begin after 10 completed forecasts per regime.")
 
     st.subheader("🔍 Recent Completed Forecasts")
     recent_df = get_recent_forecasts(25)
     if not recent_df.empty:
-        st.dataframe(recent_df, use_container_width=True, hide_index=True)
+        st.dataframe(recent_df, hide_index=True, width="stretch")
     else:
         st.info("No completed forecasts yet.")
 
@@ -975,7 +981,7 @@ def render_tab(api_client=None):
                                "t-stat": info["t_stat"],
                                "p-value": info["p_value"],
                                "Significant": "✅" if info["significant"] else "—"})
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(comp_rows), hide_index=True, width="stretch")
         if diag["weight_adjustments"]:
             st.markdown("**Proposed adjustments (applied automatically per stage):**")
             for wk, wadj in diag["weight_adjustments"].items():

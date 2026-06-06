@@ -603,7 +603,7 @@ with tab2:
                         fig.add_trace(go.Scatter(x=df["date"], y=df["vwap_20d"],
                                                  mode="lines", name="VWAP"))
                     fig.update_layout(template="plotly_dark", height=CHART_HEIGHT)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True)  # noqa: compat
                 else:
                     st.error("data_engine module not available")
 
@@ -655,7 +655,7 @@ with tab3:
                             }
                             for r in results[:top_n]
                         ])
-                        st.dataframe(df_results, use_container_width=True, hide_index=True)
+                        st.dataframe(df_results, hide_index=True, width="stretch")
                     else:
                         st.info("No setups found.")
                 except Exception as e:
