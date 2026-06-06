@@ -266,15 +266,32 @@ def analyze_skills(df: pd.DataFrame, ticker: str, segment: str = "high_activity"
 
 def get_skill_summary(skills_result: Dict) -> str:
     """Human-readable summary of skill analysis."""
+    _EMOJI = {
+        "breakout":             "\U0001f525",  # fire
+        "mean_reversion":       "\U0001f504",  # arrows
+        "trend_following":      "\U0001f4c8",  # chart
+        "volume_spike":         "\U0001f4a5",  # explosion
+        "gap_fill":             "\U0001f319",  # moon
+        "support_bounce":       "\U0001f6e1",  # shield
+        "resistance_rejection": "\U0001f6ab",  # no entry
+    }
     lines = [
-        f"Skills: {skills_result['skills_triggered']}/7 triggered | Composite: {skills_result['composite_score']}",
-        f"Direction: {skills_result['dominant_direction']} | T+0: {'Yes' if skills_result['t0_eligible'] else 'No'}"
+        (
+            f"Skills: {skills_result['skills_triggered']}/7 triggered"
+            f" | Composite: {skills_result['composite_score']}"
+        ),
+        (
+            f"Direction: {skills_result['dominant_direction']}"
+            f" | T+0: {'Yes' if skills_result['t0_eligible'] else 'No'}"
+        ),
     ]
     for d in skills_result.get("triggered_details", []):
-        emoji = "🔥" if d["skill"] == "breakout" else "🔄" if d["skill"] == "mean_reversion" else                 "📈" if d["skill"] == "trend_following" else "💥" if d["skill"] == "volume_spike" else                 "🌙" if d["skill"] == "gap_fill" else "🛡️" if d["skill"] == "support_bounce" else "🚫"
-        lines.append(f"  {emoji} {d['skill']}: {d['direction']} ({d['confidence']:.0%}) — {d['details']}")
-    return "
-".join(lines)
+        icon = _EMOJI.get(d["skill"], "?")
+        lines.append(
+            f"  {icon} {d['skill']}: {d['direction']}"
+            f" ({d['confidence']:.0%}) - {d['details']}"
+        )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
