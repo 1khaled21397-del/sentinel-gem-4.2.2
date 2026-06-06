@@ -478,11 +478,14 @@ def render_tab(claude_client=None):
 
     # ── Reports History ───────────────────────────────────────────────────
     st.subheader("📁 سجل التقارير")
-    hist_df = get_reports_history(20)
-    if not hist_df.empty:
-        st.dataframe(hist_df, hide_index=True, width="stretch")
-    else:
-        st.info("لا يوجد تقارير محفوظة بعد.")
+    try:
+        hist_df = get_reports_history(20)
+        if not hist_df.empty:
+            st.dataframe(hist_df, hide_index=True, width="stretch")
+        else:
+            st.info("لا يوجد تقارير محفوظة بعد.")
+    except Exception as _hist_err:
+        st.warning(f"⚠️ Could not load reports history: {_hist_err}")
 
     st.divider()
     st.caption(

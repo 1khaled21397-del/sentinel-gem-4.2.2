@@ -876,7 +876,13 @@ with tab7:
                 "PDF/image parsing will be unavailable. "
                 "Set ANTHROPIC_API_KEY and ensure `anthropic` is installed."
             )
-        reports.render_tab(claude_client)
+        try:
+            reports.render_tab(claude_client)
+        except Exception as _rep_err:
+            st.error(f"📋 Reports tab error: {_rep_err}")
+            with st.expander("🔧 Debug"):
+                import traceback as _tb
+                st.code(_tb.format_exc())
     else:
         st.header("📋 Analyst Reports & Signals")
         st.error(
