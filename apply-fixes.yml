@@ -95,8 +95,8 @@ jobs:
           import json
           with open('sentinel_config.json') as f:
               cfg = json.load(f)
-          assert cfg.get('version') == '4.2', f'Expected version 4.2, got {cfg.get("version")}'
-          assert 'dual_ai' in cfg.get('sentiment', {}), 'Missing dual_ai config'
+          assert cfg.get('version') == '4.2.2', f'Expected version 4.2.2, got {cfg.get("version")}'
+          assert 'triple_ai' in cfg.get('sentiment', {}), 'Missing triple_ai config'
           print('✅ sentinel_config.json valid')
           "
 
