@@ -354,7 +354,8 @@ def _generate_synthetic_data(symbol: str, days: int = 500) -> pd.DataFrame:
     low = np.minimum(low, np.minimum(open_p, prices))
 
     base_vol = np.random.uniform(100_000, 5_000_000)
-    volume = base_vol * (1 + VOL_RANGE_MULTIPLIER * (daily_range / prices.replace(0, np.nan))) * np.random.uniform(VOL_RANDOM_MIN, VOL_RANDOM_MAX, n)
+    safe_prices = np.where(prices == 0, np.nan, prices)   # np arrays have no .replace()
+    volume = base_vol * (1 + VOL_RANGE_MULTIPLIER * (daily_range / safe_prices)) * np.random.uniform(VOL_RANDOM_MIN, VOL_RANDOM_MAX, n)
 
     df = pd.DataFrame({
         "date": dates,
