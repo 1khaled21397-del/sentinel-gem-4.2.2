@@ -6,7 +6,7 @@ NEW v4.2.2: DeltaCache integration for historical data loading.
 """
 import os, json, time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 

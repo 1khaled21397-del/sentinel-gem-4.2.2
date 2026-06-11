@@ -20,6 +20,13 @@ GAP_THRESHOLD = GAP_CFG.get("gap_threshold_pct", 1.0) / 100.0
 T0_BOOST = GAP_CFG.get("t0_magnitude_boost", 1.3)
 TRAIN_CFG = GAP_CFG.get("training", {})
 
+# ── GAP PREDICTOR CONSTANTS (module-level) ────────────────────────────────────
+TRAIN_SPLIT_RATIO       = 0.8
+MAX_HEURISTIC_PROB      = 0.8
+VOL_TO_PROB_MULTIPLIER  = 10
+MAGNITUDE_VOL_MULTIPLIER = 2
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class GapPrediction:
@@ -43,14 +50,8 @@ class GapPredictor:
         self.t0_boost = T0_BOOST
 
     def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # --- Feature engineering constants ---
-        RSI_NORMALIZER = 100
-        TRAIN_SPLIT_RATIO = 0.8
-        MAX_HEURISTIC_PROB = 0.8
-        VOL_TO_PROB_MULTIPLIER = 10
-        MAGNITUDE_VOL_MULTIPLIER = 2
-        # -------------------------------------
         """Build 35 gap prediction features from indicator-enriched dataframe."""
+        RSI_NORMALIZER = 100   # local: only used in this method
         feat = pd.DataFrame(index=df.index)
         close = df["close"]
         volume = df["volume"]

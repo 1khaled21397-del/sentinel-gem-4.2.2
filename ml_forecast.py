@@ -20,6 +20,18 @@ HORIZON = ML_CFG.get("target_horizon_days", 7)
 MODELS = ML_CFG.get("models", ["xgboost", "random_forest"])
 WEIGHTS = ML_CFG.get("ensemble_weight", {"xgboost": 0.6, "random_forest": 0.4})
 
+# ── ML ENGINE CONSTANTS (module-level) ────────────────────────────────────────
+RSI_NORMALIZER      = 100
+TRAIN_SPLIT_RATIO   = 0.8
+EPSILON             = 1e-3
+XGB_N_ESTIMATORS    = 200
+XGB_MAX_DEPTH       = 5
+XGB_LEARNING_RATE   = 0.1
+RF_N_ESTIMATORS     = 200
+RF_MAX_DEPTH        = 5
+RANDOM_STATE        = 42
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class MLForecast:
@@ -43,19 +55,6 @@ class MLForecastEngine:
         self.feature_cols = FEATURES
 
     def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # --- Feature engineering constants ---
-        RSI_NORMALIZER = 100
-        TRAIN_SPLIT_RATIO = 0.8
-        EPSILON = 1e-3
-        # XGBoost hyperparameters
-        XGB_N_ESTIMATORS = 200
-        XGB_MAX_DEPTH = 5
-        XGB_LEARNING_RATE = 0.1
-        # Random Forest hyperparameters
-        RF_N_ESTIMATORS = 200
-        RF_MAX_DEPTH = 5
-        RANDOM_STATE = 42
-        # -------------------------------------
         """Build ML forecast features from indicator-enriched dataframe."""
         feat = pd.DataFrame(index=df.index)
         close = df["close"]
@@ -130,28 +129,18 @@ class MLForecastEngine:
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
-        self.xgb_model = XGBRegressor(
-            n_estimators=XGB_N_ESTIMATORS, max_depth=XGB_MAX_DEPTH, learning_rate=XGB_LEARNING_RATE,
-            subsample=0.8, colsample_bytree=0.8, random_state=42
+        xgb = XGBRegressor(
+            n_estimators=XGB_N_ESTIMATORS, max_depth=XGB_MAX_DEPTH,
+            learning_rate=XGB_LEARNING_RATE,
+            subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE
         )
-        # Build pipelines with StandardScaler
-        self.xgb_pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", self.xgb_model)
-        ])
-        self.rf_pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", self.rf_model)
-        ])
-        self.xgb_pipeline.fit(X_train, y_train)
-        self.rf_pipeline.fit(X_train, y_train)
-        # Store pipelines as primary models
-        self.xgb_model = self.xgb_pipeline
-        self.rf_model = self.rf_pipeline
-
-        self.rf_model = RandomForestRegressor(
-            n_estimators=RF_N_ESTIMATORS, max_depth=RF_MAX_DEPTH, random_state=RANDOM_STATE
+        rf = RandomForestRegressor(
+            n_estimators=RF_N_ESTIMATORS, max_depth=RF_MAX_DEPTH,
+            random_state=RANDOM_STATE
         )
+        self.xgb_model = Pipeline([("scaler", StandardScaler()), ("model", xgb)])
+        self.rf_model  = Pipeline([("scaler", StandardScaler()), ("model", rf)])
+        self.xgb_model.fit(X_train, y_train)
         self.rf_model.fit(X_train, y_train)
 
         self.is_trained = True

@@ -38,6 +38,15 @@ with open("sentinel_config.json", "r") as f:
 
 TA_CONFIG = CONFIG.get("technical_analysis", {})
 
+# ── INDICATOR ENGINE CONSTANTS (module-level so methods can reference bare names) ──
+RSI_MAX                = 100
+EMA_PROXIMITY_PCT      = 0.02   # 2% proximity band around EMA20
+GEMINI_COMPONENT_COUNT = 3
+T0_LIQUIDITY_BASE      = 0.5
+VOLUME_LIQUIDITY_CAP   = 0.5
+SLOPE_LOOKBACK         = 5
+# ────────────────────────────────────────────────────────────────────────────────
+
 # EGX T+0 / T+1 Market Segments (per EGX Feb 2024 restructure)
 T0_SEGMENTS = {
     "high_activity": "EGX100",           # T+0 enabled
@@ -132,14 +141,6 @@ class SetupQuality:
 
 class IndicatorEngine:
     """Compute all technical indicators from EOD data."""
-    # --- Technical Analysis Constants ---
-    RSI_MAX = 100
-    EMA_PROXIMITY_PCT = 0.02  # 2% proximity to EMA20
-    GEMINI_COMPONENT_COUNT = 3
-    T0_LIQUIDITY_BASE = 0.5
-    VOLUME_LIQUIDITY_CAP = 0.5
-    SLOPE_LOOKBACK = 5
-    # ------------------------------------
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()

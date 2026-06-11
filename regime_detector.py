@@ -25,6 +25,14 @@ import numpy as np
 import pandas as pd
 from typing import Dict
 
+# ── REGIME DETECTOR CONSTANTS (module-level) ──────────────────────────────────
+RSI_MAX                    = 100
+ADX_PROXY_MULTIPLIER       = 100       # converts H-L/close ratio → ADX-like score
+CONFIDENCE_BASE            = 0.40
+MAX_REGIME_SCORE           = 3         # max abs(trend_score + vol_score)
+CONSECUTIVE_DROP_THRESHOLD = -0.045    # ~EGX limit-down threshold per session
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def detect_regime(df: pd.DataFrame) -> Dict:
     """
@@ -141,6 +149,17 @@ except Exception:
 
 REGIME_CFG = CONFIG.get("regime_detector", {})
 MULTIPLIERS = REGIME_CFG.get("multipliers", {"bull": 1.0, "sideways": 0.6, "bear": 0.2})
+
+# ── ENSEMBLE CONSTANTS (loaded from config where available) ───────────────────
+_ens = REGIME_CFG.get("ensemble", {})
+DISAGREEMENT_THRESHOLD      = _ens.get("disagreement_threshold",       1.0)
+CONFLICT_HEURISTIC_WEIGHT   = 0.70   # lean toward heuristic when layers conflict
+CONFLICT_MACRO_WEIGHT       = 0.30
+CONFLICT_CONFIDENCE_PENALTY = _ens.get("confidence_penalty_conflict",  0.50)
+RISK_OFF_MULTIPLIER         = _ens.get("risk_off_size_multiplier",      0.60)
+SHOCK_MULTIPLIER            = _ens.get("shock_size_multiplier",         0.50)
+T0_RANGE_THRESHOLD          = 0.05   # 5% intraday range = T+0 spike signal
+# ─────────────────────────────────────────────────────────────────────────────
 
 # API Keys
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()

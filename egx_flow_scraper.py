@@ -16,12 +16,13 @@ with open("sentinel_config.json", "r", encoding="utf-8") as f:
 
 FLOW_CFG = CONFIG.get("flow_sentiment", {})
 
+# ── FLOW SCRAPER CONSTANTS (module-level) ─────────────────────────────────────
+MAX_CONFIDENCE        = 1.0
+RETAIL_FOMO_THRESHOLD = 0.1
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class EGXFlowScraper:
-    # --- Flow Scraper Constants ---
-    MAX_CONFIDENCE = 1.0
-    RETAIL_FOMO_THRESHOLD = 0.1
-    # ------------------------------
     """Scrape EGX market flow data for sentiment scoring."""
 
     def __init__(self):
