@@ -137,6 +137,81 @@ try:
 except ImportError:
     DELTA_CACHE_AVAILABLE = False
 
+# ── YFINANCE INTEGRATION ──
+
+try:
+    import yfinance as _yf_probe
+    YFINANCE_AVAILABLE = True
+    del _yf_probe
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+
+def _fetch_yfinance(symbol: str, days: int = 500) -> Optional[pd.DataFrame]:
+    """
+    Fetch EOD data from Yahoo Finance (free tier).
+    Translation: COMI.EGX → COMI.CA  (Cairo Exchange suffix on Yahoo Finance)
+    The .CA symbol is used ONLY for the API call; everything is returned
+    and cached under the original .EGX key so the rest of the system is unaffected.
+    """
+    if not YFINANCE_AVAILABLE:
+        return None
+
+    import yfinance as yf
+
+    # Internal translation — never exposed outside this function
+    base      = symbol.replace(".EGX", "")
+    yf_symbol = f"{base}.CA"
+
+    end   = datetime.now()
+    start = end - timedelta(days=days + 30)
+
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        raw = ticker.history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+        )
+
+        if raw is None or raw.empty or len(raw) < 20:
+            return None
+
+        df = raw.reset_index()
+        df.columns = [str(c).lower() for c in df.columns]
+
+        # Strip timezone from date column (yfinance sometimes returns tz-aware)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            if df["date"].dt.tz is not None:
+                df["date"] = df["date"].dt.tz_convert("UTC").dt.tz_localize(None)
+        else:
+            return None
+
+        # Keep only required OHLCV columns
+        for col in ["open", "high", "low"]:
+            if col not in df.columns:
+                df[col] = df["close"]
+        if "volume" not in df.columns:
+            df["volume"] = 0
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+        df = df.dropna(subset=["close"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        if len(df) < 20:
+            return None
+
+        print(f"[DataEngine] ✅ yfinance: {len(df)} bars for {symbol} (queried as {yf_symbol})")
+        return df
+
+    except Exception as e:
+        print(f"[DataEngine] yfinance failed for {symbol} ({yf_symbol}): {e}")
+        return None
+
 
 def _build_url(symbol: str, exchange: str, period: str, from_date: str, to_date: str) -> str:
     """Build EODHD API URL. FIX v4.2.1: strip duplicate exchange suffix if present in symbol."""
@@ -288,8 +363,18 @@ def fetch_eod(symbol: str, exchange: str = "EGX", period: str = "d", days: int =
 
     # ── PATH C: Full EODHD fetch ──
     if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY":
+        # No EODHD key — skip directly to yfinance
+        if YFINANCE_AVAILABLE:
+            print(f"[DataEngine] No EODHD key, trying yfinance for {symbol}")
+            df_yf = _fetch_yfinance(symbol, days)
+            if df_yf is not None and len(df_yf) >= 20:
+                legacy.set(symbol, df_yf)
+                if DELTA_CACHE_AVAILABLE:
+                    dc = DeltaCache()
+                    dc.insert_data(symbol, df_yf, source="yfinance")
+                return df_yf
         if use_synthetic_fallback:
-            print(f"[DataEngine] No API key, using synthetic data for {symbol}")
+            print(f"[DataEngine] No real data available, using synthetic for {symbol}")
             return _generate_synthetic_data(symbol, days)
         raise ValueError("EODHD_API_KEY not found. Set it in: 1) Streamlit Secrets, 2) .env file, or 3) sentinel_config.json")
 
@@ -302,8 +387,20 @@ def fetch_eod(symbol: str, exchange: str = "EGX", period: str = "d", days: int =
         print(f"[DataEngine] Full fetch: {len(df)} bars for {symbol}")
         return df
 
-    # ── PATH D: Synthetic fallback ──
-    print(f"[DataEngine] EODHD failed for {symbol}, using synthetic fallback")
+    # ── PATH D: yfinance (free real data — no API key required) ──
+    if YFINANCE_AVAILABLE:
+        print(f"[DataEngine] EODHD unavailable, trying yfinance for {symbol}")
+        df_yf = _fetch_yfinance(symbol, days)
+        if df_yf is not None and len(df_yf) >= 20:
+            legacy.set(symbol, df_yf)
+            if DELTA_CACHE_AVAILABLE:
+                dc = DeltaCache()
+                dc.insert_data(symbol, df_yf, source="yfinance")
+            return df_yf
+        print(f"[DataEngine] yfinance: no data found for {symbol} (.CA not on Yahoo Finance)")
+
+    # ── PATH E: Synthetic fallback (last resort) ──
+    print(f"[DataEngine] All sources failed for {symbol}, using synthetic fallback")
     if use_synthetic_fallback:
         return _generate_synthetic_data(symbol, days)
     return None
