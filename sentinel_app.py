@@ -629,39 +629,165 @@ with tab2:
 # TAB 3 — SCANNER
 # ══════════════════════════════════════════════════════════════════════
 with tab3:
-    st.header("📊 Market Scanner")
-    st.info("Batch scan across selected universe. Uses v4.2.2 Alpha scorer with all layers.")
+    st.header("📊 Market Scanner — Top Expected Profits")
+    st.caption("Ranks by: Expected Return % × Confidence — high conviction beats high raw return")
 
-    scan_universe = st.multiselect("Select Universe", ALL_TICKERS,
-                                   default=ALL_TICKERS[:30], key="scan_universe")
+    # ── Preset selector ──
+    EGX30_LIST = config.get("market_segments", {}).get("egx30", [])
+    EGX70_LIST = config.get("market_segments", {}).get("egx70", [])
+    EGX30_70   = list(dict.fromkeys(EGX30_LIST + EGX70_LIST))   # deduped
 
-    if st.button("🔍 Run Scanner", type="primary"):
-        if MODULES_AVAILABLE.get("overnight_alpha"):
-            with st.spinner("Scanning…"):
-                try:
-                    results = run_pipeline(scan_universe)
-                    if results:
-                        st.success(f"Found {len(results)} setups")
-                        df_results = pd.DataFrame([
-                            {
-                                "Ticker":  r["ticker"],
-                                "Alpha":   r["alpha"],
-                                "T0":      "✅" if r["t0_eligible"] else "⏳",
-                                "Setup":   r["setup"].get("setup_type","?"),
-                                "Gap":     r["gap"].get("direction","?"),
-                                "R/R":     r["setup"].get("rr", 0),
-                                "Session": r["setup"].get("best_session","?"),
-                                "Regime":  r.get("learning_regime","?"),   # NEW
-                            }
-                            for r in results[:top_n]
-                        ])
-                        st.dataframe(df_results, hide_index=True, width="stretch")
-                    else:
-                        st.info("No setups found.")
-                except Exception as e:
-                    st.error(f"Scanner failed: {e}")
-        else:
+    preset_labels = {
+        f"⚡ EGX30  ({len(EGX30_LIST)} tickers, ~2 min)":       EGX30_LIST,
+        f"📊 EGX30 + EGX70  ({len(EGX30_70)} tickers, ~5 min)": EGX30_70,
+        f"🌍 Full universe  ({len(ALL_TICKERS)} tickers, ~10 min)": ALL_TICKERS,
+    }
+
+    col_preset, col_topn = st.columns([3, 1])
+    with col_preset:
+        chosen_preset = st.radio(
+            "Scan Universe",
+            list(preset_labels.keys()),
+            horizontal=True,
+            key="scan_preset",
+        )
+    with col_topn:
+        scan_top_n = st.number_input(
+            "Top N results", min_value=1, max_value=50, value=19, key="scan_top_n"
+        )
+
+    scan_universe = preset_labels[chosen_preset]
+
+    if st.button("🔍 Run Scanner", type="primary", key="run_scanner_btn"):
+        if not MODULES_AVAILABLE.get("overnight_alpha"):
             st.error("overnight_alpha module required for scanner")
+        else:
+            from overnight_alpha import OvernightAlphaPipeline
+
+            pipeline     = OvernightAlphaPipeline(scan_universe)
+            progress_bar = st.progress(0)
+            status_txt   = st.empty()
+            all_results  = []
+
+            for idx, ticker in enumerate(scan_universe):
+                progress_bar.progress((idx + 1) / len(scan_universe))
+                status_txt.text(f"Scanning {ticker}… ({idx+1}/{len(scan_universe)})")
+                try:
+                    res = pipeline.run_ticker(ticker, min_alpha=0.0)
+                    if res is None:
+                        continue
+
+                    ml     = res.ml_forecast or {}
+                    setup  = res.setup       or {}
+
+                    ml_return = float(ml.get("target_return", 0) or 0)
+                    ml_conf   = float(ml.get("confidence",     0) or 0)
+
+                    targets   = setup.get("targets",    [])
+                    entry     = setup.get("entry_zone", (0, 0))
+
+                    # ── Expected return: ML primary, VAMP fallback ──
+                    if ml_return > 0 and ml_conf > 0.3:
+                        exp_pct    = ml_return * 100
+                        confidence = ml_conf
+                        source     = "ML"
+                    elif targets and isinstance(entry, (list, tuple)) and len(entry) == 2:
+                        entry_mid = (entry[0] + entry[1]) / 2
+                        if entry_mid > 0 and targets[0] > 0:
+                            exp_pct    = (targets[0] - entry_mid) / entry_mid * 100
+                            confidence = (setup.get("quality_score") or 50) / 100
+                            source     = "VAMP"
+                        else:
+                            continue
+                    else:
+                        continue
+
+                    if exp_pct <= 0:
+                        continue
+
+                    # ── Ranking metric: return × confidence ──
+                    profit_score = exp_pct * confidence
+
+                    all_results.append({
+                        "ticker":       res.ticker,
+                        "exp_pct":      exp_pct,
+                        "confidence":   confidence,
+                        "profit_score": profit_score,
+                        "source":       source,
+                        "alpha":        res.alpha,
+                        "t0":           res.t0_eligible,
+                        "setup_type":   setup.get("setup_type", "?"),
+                        "rr":           _clean_val(setup.get("rr", 0)),
+                        "gap":          res.gap.get("direction", "?"),
+                        "regime":       res.learning_regime or "?",
+                    })
+
+                except Exception:
+                    continue
+
+            progress_bar.empty()
+            status_txt.empty()
+
+            # ── Sort and slice ──
+            all_results.sort(key=lambda x: x["profit_score"], reverse=True)
+            top = all_results[:scan_top_n]
+
+            if not top:
+                st.info("No stocks with positive expected return found. Try a different universe.")
+            else:
+                st.success(
+                    f"✅ Scanned {len(scan_universe)} tickers  |  "
+                    f"{len(all_results)} with positive outlook  |  "
+                    f"Showing top {len(top)}"
+                )
+
+                # ── Results table ──
+                rows = []
+                for rank, r in enumerate(top, 1):
+                    rows.append({
+                        "#":               rank,
+                        "Ticker":          r["ticker"],
+                        "Expected Return": f"+{r['exp_pct']:.1f}%",
+                        "Confidence":      f"{r['confidence']:.0%}",
+                        "Score":           f"{r['profit_score']:.2f}",
+                        "Source":          r["source"],
+                        "Alpha":           f"{r['alpha']:.2f}",
+                        "T+0":             "✅" if r["t0"] else "⏳",
+                        "Setup":           r["setup_type"],
+                        "R/R":             f"{r['rr']:.1f}",
+                        "Gap":             r["gap"],
+                        "Regime":          r["regime"],
+                    })
+                st.dataframe(
+                    pd.DataFrame(rows), hide_index=True, use_container_width=True
+                )
+
+                # ── Bar chart — top 10 ──
+                chart_n  = min(10, len(top))
+                bar_data = top[:chart_n]
+
+                fig = go.Figure(go.Bar(
+                    x=[r["ticker"]  for r in bar_data],
+                    y=[r["exp_pct"] for r in bar_data],
+                    marker_color=[
+                        f"rgba(16,185,129,{max(0.25, r['confidence'])})"
+                        for r in bar_data
+                    ],
+                    text=[f"+{r['exp_pct']:.1f}%" for r in bar_data],
+                    textposition="outside",
+                ))
+                fig.update_layout(
+                    title="Top Stocks by Expected 7-Day Return  (bar opacity = confidence)",
+                    template="plotly_dark",
+                    height=380,
+                    paper_bgcolor="#0f172a",
+                    plot_bgcolor="#0f172a",
+                    font=dict(color="#e2e8f0"),
+                    yaxis_title="Expected Return %",
+                    showlegend=False,
+                    margin=dict(t=50, b=20),
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════
 # TAB 4 — WATCHLISTS

@@ -64,8 +64,12 @@ class OvernightAlphaPipeline:
     # SINGLE-TICKER PIPELINE
     # ------------------------------------------------------------------
 
-    def run_ticker(self, ticker: str) -> Optional[OvernightAlphaResult]:
-        """Run full pipeline for a single ticker."""
+    def run_ticker(self, ticker: str, min_alpha: float = None) -> Optional[OvernightAlphaResult]:
+        """Run full pipeline for a single ticker.
+
+        min_alpha: override the config threshold (pass 0.0 to return all
+                   positive-return tickers regardless of composite alpha).
+        """
         try:
             from data_engine import fetch_and_build, get_segment
             from technical_analysis import analyze_ticker
@@ -215,7 +219,8 @@ class OvernightAlphaPipeline:
             wc_weight=effective_wc_weight,
         )
 
-        if alpha < MIN_ALPHA:
+        effective_min = min_alpha if min_alpha is not None else MIN_ALPHA
+        if alpha < effective_min:
             return None
 
         # 9. Log forecast for self-learning feedback loop

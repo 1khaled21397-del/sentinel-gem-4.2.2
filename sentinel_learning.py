@@ -889,12 +889,12 @@ def render_tab(api_client=None):
                 continue
             clrs  = [REGIMES.get(r, {}).get("color", "#64748b") for r in mdf["regime"]]
             xlbls = [f"{REGIMES.get(r,{}).get('emoji','?')} {r}" for r in mdf["regime"]]
-            fig.add_trace(go.Bar(name=model, x=xlbls, y=mdf["dir_acc_pct"], opacity=opacity,
+            fig.add_trace(go.Bar(name=model, x=xlbls, y=mdf["dir_acc_pct"].fillna(0), opacity=opacity,
                                  marker_color=clrs, showlegend=True,
-                                 text=mdf["dir_acc_pct"].round(1), textposition="auto"), row=1, col=1)
-            fig.add_trace(go.Bar(name=f"MAE {model}", x=xlbls, y=mdf["mae"], opacity=opacity,
+                                 text=mdf["dir_acc_pct"].fillna(0).round(1), textposition="auto"), row=1, col=1)
+            fig.add_trace(go.Bar(name=f"MAE {model}", x=xlbls, y=mdf["mae"].fillna(0), opacity=opacity,
                                  marker_color=clrs, showlegend=False,
-                                 text=mdf["mae"].round(2), textposition="auto"), row=1, col=2)
+                                 text=mdf["mae"].fillna(0).round(2), textposition="auto"), row=1, col=2)
         fig.add_hline(y=50, line_dash="dash", line_color="#94a3b8",
                       annotation_text="50% (random)", row=1, col=1)
         fig.update_layout(template="plotly_dark", height=360, barmode="group",
