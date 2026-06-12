@@ -48,12 +48,12 @@ SLOPE_LOOKBACK         = 5
 # ────────────────────────────────────────────────────────────────────────────────
 
 # EGX T+0 / T+1 Market Segments (per EGX Feb 2024 restructure)
+# T+0 segment display labels (informational only — eligibility now driven by config)
 T0_SEGMENTS = {
-    "high_activity": "EGX100",           # T+0 enabled
-    "moderate_activity": "Moderate",      # T+0 enabled  
-    "tamayuz": "Tamayuz",                 # T+0 enabled
-    "low_activity": "Low",                # T+1 ONLY
-    "nile": "Nile",                       # T+1 ONLY
+    "high_activity":    "EGX100",
+    "moderate_activity":"Moderate",
+    "egx30":            "EGX30",
+    "low_activity":     "Low",
 }
 
 # ============================================================================
@@ -400,7 +400,11 @@ class IndicatorEngine:
         High-momentum T+0 stocks exhibit higher volatility and sharper 
         indicator reactions during first and last hours.
         """
-        t0_eligible = market_segment in ["high_activity", "moderate_activity", "tamayuz"]
+        # T+0 eligibility driven by config (includes egx30, high_activity, moderate_activity)
+        _t0_segments = set(CONFIG.get("t0_rules", {}).get("t0_enabled_segments", [
+            "high_activity", "moderate_activity"
+        ]))
+        t0_eligible = market_segment in _t0_segments
 
         # Volume vs average
         vol_avg = self.df["volume"].rolling(20).mean()
