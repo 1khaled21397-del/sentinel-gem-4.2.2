@@ -209,11 +209,12 @@ def _call_gemini(parts: list) -> Optional[str]:
             },
             timeout=90,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # Return structured error so caller can surface it to the UI
+            return f"__GEMINI_ERROR__{resp.status_code}::{resp.text[:400]}"
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print(f"[Reports] Gemini generate error: {e}")
-        return None
+        return f"__GEMINI_ERROR__network::{str(e)}"
 
 
 def _parse_with_gemini(file_bytes: bytes, ext: str) -> Optional[str]:
@@ -313,8 +314,14 @@ def parse_report(file_bytes: bytes, file_name: str,
             print(f"[Reports] Claude fallback error: {e}")
 
     if not raw_text:
-        return {"signals": [], "report_summary": "فشل التحليل — تعذّر الاتصال بـ Gemini أو Claude",
+        return {"signals": [], "report_summary": "فشل التحليل — لم يُستلم رد من Gemini أو Claude",
                 "error": "no_response"}
+
+    # Surface any Gemini HTTP/network error so the UI can display it
+    if isinstance(raw_text, str) and raw_text.startswith("__GEMINI_ERROR__"):
+        err_detail = raw_text.replace("__GEMINI_ERROR__", "")
+        return {"signals": [], "report_summary": f"Gemini API Error: {err_detail}",
+                "error": "gemini_api_error", "error_detail": err_detail}
 
     try:
         clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
@@ -515,6 +522,19 @@ def render_tab(claude_client=None):
         engine_label += " + Claude fallback"
     st.caption(f"محرك التحليل: {engine_label} | الحد الأقصى للملف: 15 MB (inline) أو أكبر via Files API")
 
+    # ── Gemini connectivity test ──────────────────────────────────────────
+    with st.expander("🔧 Gemini API Diagnostic", expanded=False):
+        if st.button("▶️ Test Gemini Connection", key="test_gemini_btn"):
+            with st.spinner("Testing Gemini API key…"):
+                test_result = _call_gemini([{"text": "Reply with the single word: OK"}])
+            if test_result and not test_result.startswith("__GEMINI_ERROR__"):
+                st.success(f"✅ Gemini working — response: {test_result.strip()[:80]}")
+            elif test_result:
+                err = test_result.replace("__GEMINI_ERROR__", "")
+                st.error(f"❌ Gemini failed:\n```\n{err}\n```")
+            else:
+                st.error("❌ No response — possible network block")
+
     # ── Upload ────────────────────────────────────────────────────────────
     st.subheader("📤 رفع تقرير جديد")
     uploaded = st.file_uploader(
@@ -535,11 +555,16 @@ def render_tab(claude_client=None):
                 parsed = parse_report(file_bytes, uploaded.name, claude_client)
 
             if not parsed:
-                st.error("فشل التحليل — تأكد من Claude API key")
+                st.error("فشل التحليل — تأكد من Gemini API key")
+                return
+
+            if parsed.get("error") == "gemini_api_error":
+                st.error(f"❌ Gemini API Error:\n```\n{parsed.get('error_detail','')}\n```")
+                st.info("الحل: تحقق من المفتاح في Streamlit Secrets أو جرّب مفتاح جديد من aistudio.google.com")
                 return
 
             if parsed.get("error"):
-                st.warning(f"⚠️ {parsed['error']}")
+                st.warning(f"⚠️ {parsed.get('report_summary','')}")
 
             signals = parsed.get("signals", [])
             summary = parsed.get("report_summary", "")
