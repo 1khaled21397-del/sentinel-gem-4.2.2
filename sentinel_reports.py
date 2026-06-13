@@ -156,7 +156,7 @@ _EXTRACT_PROMPT = """أنت محلل مالي متخصص في تقارير مب�
 
 _GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash:generateContent?key={key}"
+    "gemini-2.0-flash:generateContent?key={key}"
 )
 _GEMINI_UPLOAD_URL = (
     "https://generativelanguage.googleapis.com/upload/v1beta/files?key={key}"

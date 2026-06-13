@@ -141,7 +141,7 @@ Respond ONLY with valid JSON."""
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 256,
                 "messages": [{"role": "user", "content": prompt}]
             },
@@ -216,7 +216,7 @@ Headlines:
 Respond ONLY with valid JSON."""
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         resp = requests.post(
             url,
             headers={"Content-Type": "application/json"},
