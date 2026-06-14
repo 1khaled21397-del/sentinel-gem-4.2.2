@@ -40,8 +40,12 @@ def _get_secret(key: str) -> str:
             pass
     return val
 
-OPENROUTER_KEY = _get_secret("KIMI_API_KEY")     # OpenRouter stored as KIMI
-GEMINI_KEY     = _get_secret("GEMINI_API_KEY")    # Gemini fallback
+def _openrouter_key() -> str:
+    """Always read at call time — never cached at module level."""
+    return _get_secret("KIMI_API_KEY")
+
+def _gemini_key() -> str:
+    return _get_secret("GEMINI_API_KEY")
 
 OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
@@ -118,27 +122,96 @@ def _extract_folder_id(url: str) -> Optional[str]:
     return None
 
 def _list_drive_folder(folder_id: str) -> List[Dict]:
-    """List PDF files in a public Google Drive folder — no API key needed."""
+    """
+    List PDF files in a public Google Drive folder.
+    Strategy 1: gdown internal listing (most reliable)
+    Strategy 2: scrape folder HTML with multiple regex patterns
+    """
+    # ── Strategy 1: gdown ────────────────────────────────────────────────
+    try:
+        import gdown
+        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+        # gdown.download_folder returns list of downloaded paths;
+        # with a temp dir we can list without keeping files
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            paths = gdown.download_folder(
+                folder_url, output=tmp, quiet=True,
+                use_cookies=False, skip_download=True,
+            )
+        except TypeError:
+            # older gdown versions don't have skip_download
+            paths = None
+
+        if paths is not None:
+            files = []
+            for p in paths:
+                name = Path(p).name
+                if name.lower().endswith(".pdf"):
+                    # extract file id from the path or re-match from folder
+                    files.append({"id": Path(p).stem, "name": name})
+            shutil.rmtree(tmp, ignore_errors=True)
+            if files:
+                return sorted(files, key=lambda x: x["name"], reverse=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        print(f"[Reports] gdown listing error: {e}")
+
+    # ── Strategy 2: HTML scrape with multiple patterns ────────────────────
     try:
         resp = requests.get(
             f"https://drive.google.com/drive/folders/{folder_id}",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             timeout=15,
         )
-        # Drive embeds file data as JSON — extract file IDs and PDF names
-        matches = re.findall(
+        seen, files = set(), []
+
+        # Pattern A — classic embedded JSON array format
+        for fid, fname in re.findall(
             r'\["([A-Za-z0-9_-]{25,})",null,"([^"]+\.pdf)"',
             resp.text, re.IGNORECASE
-        )
-        seen, files = set(), []
-        for fid, fname in matches:
+        ):
             if fid not in seen:
                 seen.add(fid)
                 files.append({"id": fid, "name": fname})
-        return sorted(files, key=lambda x: x["name"], reverse=True)
+
+        # Pattern B — newer Drive format
+        if not files:
+            for fid, fname in re.findall(
+                r'"([A-Za-z0-9_-]{25,})","[^"]*","([^"]+\.pdf)"',
+                resp.text, re.IGNORECASE
+            ):
+                if fid not in seen:
+                    seen.add(fid)
+                    files.append({"id": fid, "name": fname})
+
+        if files:
+            return sorted(files, key=lambda x: x["name"], reverse=True)
     except Exception as e:
-        print(f"[Reports] Drive listing error: {e}")
-        return []
+        print(f"[Reports] HTML scrape error: {e}")
+
+    # ── Strategy 3: Google Drive export index (public API, no key) ────────
+    try:
+        resp = requests.get(
+            f"https://drive.google.com/drive/folders/{folder_id}?usp=sharing",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        seen, files = set(), []
+        for fid, fname in re.findall(
+            r'data-id="([A-Za-z0-9_-]{25,})"[^>]*>([^<]+\.pdf)',
+            resp.text, re.IGNORECASE
+        ):
+            if fid not in seen:
+                seen.add(fid)
+                files.append({"id": fid, "name": fname.strip()})
+        if files:
+            return sorted(files, key=lambda x: x["name"], reverse=True)
+    except Exception as e:
+        print(f"[Reports] Strategy 3 error: {e}")
+
+    return []
 
 def _download_drive_file(file_id: str) -> Optional[bytes]:
     """Download a public Google Drive file using gdown."""
@@ -241,7 +314,7 @@ def _call_openrouter(images_b64: List[str]) -> str:
         resp = requests.post(
             OPENROUTER_URL,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Authorization": f"Bearer {_openrouter_key()}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://sentinel-egx.streamlit.app",
             },
@@ -260,7 +333,7 @@ def _call_openrouter(images_b64: List[str]) -> str:
 
 def _call_gemini_vision(images_b64: List[str]) -> Optional[str]:
     """Gemini fallback for vision."""
-    if not GEMINI_KEY:
+    if not _gemini_key():
         return None
     parts = [
         {"inline_data": {"mime_type": "image/png", "data": b}}
@@ -269,7 +342,7 @@ def _call_gemini_vision(images_b64: List[str]) -> Optional[str]:
     parts.append({"text": _PROMPT})
     try:
         resp = requests.post(
-            GEMINI_URL.format(key=GEMINI_KEY),
+            GEMINI_URL.format(key=_gemini_key()),
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": parts}],
                   "generationConfig": {"temperature": 0.1, "maxOutputTokens": 3000}},
@@ -337,7 +410,7 @@ def parse_report(file_bytes: bytes, file_name: str,
         batch = images[i:i + PAGES_PER_BATCH]
 
         # Primary: OpenRouter
-        raw = _call_openrouter(batch) if OPENROUTER_KEY else None
+        raw = _call_openrouter(batch) if _openrouter_key() else None
 
         if raw and raw.startswith("__ERROR__"):
             err = raw.replace("__ERROR__", "")
@@ -517,12 +590,12 @@ def render_tab(claude_client=None):
         "Single Stock panel with specific alpha recommendations"
     )
 
-    if not OPENROUTER_KEY:
+    if not _openrouter_key():
         st.error("❌ KIMI_API_KEY (OpenRouter) not found in Streamlit Secrets")
         return
 
     engine = f"🤖 OpenRouter ({OPENROUTER_MODEL})"
-    if GEMINI_KEY:
+    if _gemini_key():
         engine += " + Gemini fallback"
     st.caption(engine)
 
