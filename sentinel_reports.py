@@ -1,19 +1,11 @@
 """
-Sentinel-EGX v3.8 — Reports & Analyst Signals
-==============================================
-يستقبل ملفات التقارير (PDF/صورة/Excel) يدوياً،
-يحللها بـ Claude API، يستخرج التوصيات،
-ويستخدمها كـ signal إضافي في VAMP.
-
-Integration (sentinel_app.py):
-    import sentinel_reports as reports
-
-    # Tab 6:
-    with tab6:
-        reports.render_tab(claude)
-
-    # في get_egx_prediction() قبل return result:
-    result["analyst_signal"] = reports.get_active_signal(result["Symbol"])
+Sentinel-EGX v4.3.0 — Reports & Analyst Signals
+================================================
+Engine  : OpenRouter vision (KIMI_API_KEY) — primary
+Fallback: Gemini 2.0 Flash direct API
+PDF     : pymupdf → page images → batched vision calls (5 pages/batch)
+Drive   : public folder URL → list + auto-download + skip already-analyzed
+Cache   : SQLite drive_cache table — never re-processes same file
 """
 
 import json
@@ -34,21 +26,29 @@ warnings.filterwarnings("ignore")
 SCRIPT_DIR      = Path(__file__).parent.resolve()
 REPORTS_DB      = SCRIPT_DIR / "sentinel_reports.db"
 SIGNAL_TTL_DAYS = 14
+PAGES_PER_BATCH = 5       # images per OpenRouter request
+PDF_DPI         = 100     # lower = fewer tokens, faster
 
-# ── Gemini API key (primary engine for report analysis) ──────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-if not GEMINI_API_KEY:
-    try:
-        import streamlit as st
-        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "").strip()
-    except Exception:
-        pass
-# ─────────────────────────────────────────────────────────────────────────────
+# ── API KEYS ──────────────────────────────────────────────────────────────────
+def _get_secret(key: str) -> str:
+    val = os.getenv(key, "").strip()
+    if not val:
+        try:
+            import streamlit as st
+            val = st.secrets.get(key, "").strip()
+        except Exception:
+            pass
+    return val
 
-# ===========================================================================
-# 1. DATABASE
-# ===========================================================================
+OPENROUTER_KEY = _get_secret("KIMI_API_KEY")     # OpenRouter stored as KIMI
+GEMINI_KEY     = _get_secret("GEMINI_API_KEY")    # Gemini fallback
 
+OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+GEMINI_URL       = ("https://generativelanguage.googleapis.com/v1beta/models/"
+                    "gemini-2.0-flash:generateContent?key={key}")
+
+# ── DATABASE ──────────────────────────────────────────────────────────────────
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(REPORTS_DB))
     conn.row_factory = sqlite3.Row
@@ -60,30 +60,43 @@ def init_db():
     PRAGMA journal_mode=WAL;
 
     CREATE TABLE IF NOT EXISTS reports (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename     TEXT NOT NULL,
-        file_type    TEXT NOT NULL,
-        source       TEXT DEFAULT 'manual',
-        raw_text     TEXT,
-        uploaded_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename        TEXT NOT NULL,
+        file_type       TEXT NOT NULL,
+        drive_file_id   TEXT,
+        source          TEXT DEFAULT 'manual',
+        raw_text        TEXT,
+        report_type     TEXT,
+        report_date     TEXT,
+        market_overview TEXT,
+        uploaded_at     TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS analyst_signals (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        report_id    INTEGER REFERENCES reports(id),
-        symbol       TEXT NOT NULL,
-        action       TEXT,         -- BUY / SELL / HOLD / WATCH
-        entry_low    REAL,
-        entry_high   REAL,
-        target1      REAL,
-        target2      REAL,
-        target3      REAL,
-        stop_loss    REAL,
-        timeframe    TEXT,
-        confidence   TEXT,         -- HIGH / MEDIUM / LOW
-        notes        TEXT,
-        valid_until  TEXT,
-        created_at   TEXT DEFAULT CURRENT_TIMESTAMP
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id     INTEGER REFERENCES reports(id),
+        symbol        TEXT NOT NULL,
+        action        TEXT,
+        entry_low     REAL, entry_high REAL,
+        target1       REAL, target2 REAL, target3 REAL,
+        stop_loss     REAL,
+        s1 REAL, s2 REAL, s3 REAL,
+        r1 REAL, r2 REAL, r3 REAL,
+        timeframe     TEXT,
+        confidence    TEXT,
+        pattern       TEXT,
+        rsi           REAL,
+        volume_signal TEXT,
+        notes         TEXT,
+        valid_until   TEXT,
+        created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS drive_cache (
+        file_id     TEXT PRIMARY KEY,
+        filename    TEXT NOT NULL,
+        report_id   INTEGER REFERENCES reports(id),
+        analyzed_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE INDEX IF NOT EXISTS idx_sig_symbol ON analyst_signals(symbol);
@@ -94,338 +107,329 @@ def init_db():
 
 init_db()
 
-# ===========================================================================
-# 2. FILE PARSER — Claude API
-# ===========================================================================
+# ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
+def _extract_folder_id(url: str) -> Optional[str]:
+    for pattern in [r'/drive/folders/([A-Za-z0-9_-]{25,})',
+                    r'id=([A-Za-z0-9_-]{25,})',
+                    r'^([A-Za-z0-9_-]{25,})$']:
+        m = re.search(pattern, url.strip())
+        if m:
+            return m.group(1)
+    return None
 
-_EXTRACT_PROMPT = """أنت محلل مالي متخصص في تقارير مباشر (Mubasher) للبورصة المصرية EGX.
-اقرأ هذا التقرير بعناية واستخرج كل التوصيات ومستويات التحليل الفني لكل سهم.
+def _list_drive_folder(folder_id: str) -> List[Dict]:
+    """List PDF files in a public Google Drive folder — no API key needed."""
+    try:
+        resp = requests.get(
+            f"https://drive.google.com/drive/folders/{folder_id}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=15,
+        )
+        # Drive embeds file data as JSON — extract file IDs and PDF names
+        matches = re.findall(
+            r'\["([A-Za-z0-9_-]{25,})",null,"([^"]+\.pdf)"',
+            resp.text, re.IGNORECASE
+        )
+        seen, files = set(), []
+        for fid, fname in matches:
+            if fid not in seen:
+                seen.add(fid)
+                files.append({"id": fid, "name": fname})
+        return sorted(files, key=lambda x: x["name"], reverse=True)
+    except Exception as e:
+        print(f"[Reports] Drive listing error: {e}")
+        return []
 
-أرجع JSON فقط، بدون أي نص إضافي أو Markdown، بهذا الشكل بالضبط:
+def _download_drive_file(file_id: str) -> Optional[bytes]:
+    """Download a public Google Drive file using gdown."""
+    try:
+        import gdown, tempfile
+        url    = f"https://drive.google.com/uc?id={file_id}"
+        fpath  = tempfile.mktemp(suffix=".pdf")
+        result = gdown.download(url, fpath, quiet=True, fuzzy=True, use_cookies=False)
+        if result and Path(result).exists():
+            data = Path(result).read_bytes()
+            Path(result).unlink(missing_ok=True)
+            return data
+        return None
+    except Exception as e:
+        print(f"[Reports] Drive download error: {e}")
+        return None
+
+def is_drive_analyzed(file_id: str) -> bool:
+    conn = _db()
+    row  = conn.execute("SELECT 1 FROM drive_cache WHERE file_id=?", (file_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+def _mark_drive_analyzed(file_id: str, filename: str, report_id: int):
+    conn = _db()
+    conn.execute("""
+        INSERT OR REPLACE INTO drive_cache (file_id, filename, report_id, analyzed_at)
+        VALUES (?,?,?,?)
+    """, (file_id, filename, report_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+# ── PDF → IMAGES ──────────────────────────────────────────────────────────────
+def _pdf_to_images(pdf_bytes: bytes) -> List[str]:
+    """Convert every PDF page to base64 PNG using pymupdf."""
+    try:
+        import fitz
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        mat  = fitz.Matrix(PDF_DPI / 72, PDF_DPI / 72)
+        imgs = []
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
+            imgs.append(base64.b64encode(pix.tobytes("png")).decode())
+        doc.close()
+        return imgs
+    except Exception as e:
+        print(f"[Reports] PDF→images error: {e}")
+        return []
+
+# ── EXTRACTION PROMPT ─────────────────────────────────────────────────────────
+_PROMPT = """You are a senior financial analyst specializing in Mubasher institutional research for the Egyptian Exchange (EGX).
+Analyze ALL pages and extract every stock recommendation and technical level.
+The report may contain Arabic and English text — extract from both.
+
+Return ONLY valid JSON, no markdown:
 {
-  "report_type": "technical_analysis",
-  "report_date": "2025-06-01",
-  "market_overview": "نظرة عامة على السوق في جملة واحدة أو null",
+  "report_type": "morning_call",
+  "report_date": "2026-06-08",
+  "market_overview": "One sentence market summary or null",
   "signals": [
     {
       "symbol": "COMI",
       "action": "BUY",
-      "entry_low": 75.0,
-      "entry_high": 78.0,
-      "target1": 85.0,
-      "target2": 92.0,
-      "target3": null,
+      "entry_low": 75.0, "entry_high": 78.0,
+      "target1": 85.0, "target2": 92.0, "target3": null,
       "stop_loss": 71.0,
-      "s1": 73.0,
-      "s2": 70.0,
-      "s3": null,
-      "r1": 82.0,
-      "r2": 89.0,
-      "r3": null,
-      "timeframe": "2-4 أسابيع",
+      "s1": 73.0, "s2": 70.0, "s3": null,
+      "r1": 82.0, "r2": 89.0, "r3": null,
+      "timeframe": "2-4 weeks",
       "confidence": "HIGH",
-      "pattern": "اختراق مقاومة مع حجم مرتفع",
+      "pattern": "Resistance breakout high volume",
       "rsi": 58.0,
-      "volume_signal": "مرتفع",
-      "notes": "أي ملاحظات إضافية"
+      "volume_signal": "High",
+      "notes": "Additional context"
     }
   ],
-  "report_summary": "ملخص التقرير في جملة واحدة"
+  "report_summary": "One sentence summary"
 }
 
-قواعد صارمة:
-- symbol: رمز السهم بالأحرف الإنجليزية بدون .EGX (مثل COMI وليس COMI.EGX)
-- action: BUY أو SELL أو HOLD أو WATCH فقط — لا قيم أخرى
-- report_type: technical_analysis | morning_call | daily_summary | insider_trading | stock_info | egx_daily
-- report_date: تاريخ التقرير بصيغة YYYY-MM-DD أو null
-- جميع الأرقام الفنية كـ float أو null إذا لم تُذكر صراحةً في التقرير
-- s1/s2/s3: مستويات الدعم الأول والثاني والثالث
-- r1/r2/r3: مستويات المقاومة الأول والثاني والثالث
-- target1/target2/target3: الأهداف السعرية المستهدفة بالترتيب
-- entry_low/entry_high: منطقة الدخول الموصى بها (سعر الشراء)
-- stop_loss: مستوى وقف الخسارة
-- pattern: النمط الفني أو الإشارة (مثل: اختراق، ارتداد، ضغط، تقاطع)
-- confidence: HIGH إذا كانت التوصية واضحة وقوية، MEDIUM إذا كانت محتملة، LOW إذا كانت مشروطة
-- إذا احتوى التقرير على أسهم متعددة، استخرج توصية لكل سهم في مصفوفة signals
-- إذا لم تجد توصيات واضحة، أرجع signals كـ []
+RULES:
+- symbol: ticker WITHOUT .EGX suffix
+- action: BUY | SELL | HOLD | WATCH only
+- report_type: morning_call | technical_analysis | daily_summary | insider_trading | stock_info | egx_daily
+- All price fields: float or null if not mentioned
+- s1/s2/s3 = support levels, r1/r2/r3 = resistance levels
+- confidence: HIGH=clear strong call, MEDIUM=conditional, LOW=speculative
+- Extract ALL stocks mentioned across all pages
+- signals: [] if no clear recommendations
 """
 
-# ===========================================================================
-# 2. FILE PARSER — Gemini primary / Claude fallback
-# ===========================================================================
-
-_GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent?key={key}"
-)
-_GEMINI_UPLOAD_URL = (
-    "https://generativelanguage.googleapis.com/upload/v1beta/files?key={key}"
-)
-_INLINE_SIZE_LIMIT = 15 * 1024 * 1024   # 15 MB raw → ~20 MB base64
-
-
-def _upload_to_gemini_files(file_bytes: bytes, mime_type: str) -> Optional[str]:
-    """
-    Upload large file (>15 MB) via Gemini Files API.
-    Returns the file URI to reference in the generate request.
-    """
-    boundary = "sentinel_gemini_boundary"
-    metadata  = json.dumps({"file": {"displayName": "mubasher_report"}}).encode()
-
-    body = (
-        f"--{boundary}\r\n"
-        f"Content-Type: application/json; charset=utf-8\r\n\r\n"
-    ).encode() + metadata + (
-        f"\r\n--{boundary}\r\n"
-        f"Content-Type: {mime_type}\r\n\r\n"
-    ).encode() + file_bytes + f"\r\n--{boundary}--".encode()
-
+# ── OPENROUTER VISION ─────────────────────────────────────────────────────────
+def _call_openrouter(images_b64: List[str]) -> str:
+    """Send image batch to OpenRouter free vision model."""
+    content = [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
+        for b in images_b64
+    ]
+    content.append({"type": "text", "text": _PROMPT})
     try:
         resp = requests.post(
-            _GEMINI_UPLOAD_URL.format(key=GEMINI_API_KEY),
+            OPENROUTER_URL,
             headers={
-                "Content-Type": f"multipart/related; boundary={boundary}",
-                "Content-Length": str(len(body)),
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://sentinel-egx.streamlit.app",
             },
-            data=body,
-            timeout=180,
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 3000,
+            },
+            timeout=120,
         )
-        resp.raise_for_status()
-        return resp.json().get("file", {}).get("uri")
+        if not resp.ok:
+            return f"__ERROR__{resp.status_code}::{resp.text[:300]}"
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"[Reports] Gemini file upload error: {e}")
+        return f"__ERROR__network::{e}"
+
+def _call_gemini_vision(images_b64: List[str]) -> Optional[str]:
+    """Gemini fallback for vision."""
+    if not GEMINI_KEY:
         return None
-
-
-def _call_gemini(parts: list) -> Optional[str]:
-    """Send parts list to Gemini 1.5 Flash and return raw text response."""
+    parts = [
+        {"inline_data": {"mime_type": "image/png", "data": b}}
+        for b in images_b64
+    ]
+    parts.append({"text": _PROMPT})
     try:
         resp = requests.post(
-            _GEMINI_URL.format(key=GEMINI_API_KEY),
+            GEMINI_URL.format(key=GEMINI_KEY),
             headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-            },
+            json={"contents": [{"parts": parts}],
+                  "generationConfig": {"temperature": 0.1, "maxOutputTokens": 3000}},
             timeout=90,
         )
         if not resp.ok:
-            # Return structured error so caller can surface it to the UI
-            return f"__GEMINI_ERROR__{resp.status_code}::{resp.text[:400]}"
+            return None
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"__GEMINI_ERROR__network::{str(e)}"
+    except Exception:
+        return None
 
-
-def _parse_with_gemini(file_bytes: bytes, ext: str) -> Optional[str]:
-    """
-    Route file to Gemini:
-      • PDF / image  → inline base64 (≤15 MB) or Files API (>15 MB)
-      • Excel / CSV  → pandas text → Gemini text
-      • Plain text   → Gemini text
-    """
-    mime_map = {
-        ".pdf":  "application/pdf",
-        ".png":  "image/png",
-        ".jpg":  "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-    }
-    mime_type = mime_map.get(ext)
-
-    if mime_type:
-        size = len(file_bytes)
-        if size <= _INLINE_SIZE_LIMIT:
-            # Inline base64 — fast path
-            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-            parts = [
-                {"inline_data": {"mime_type": mime_type, "data": b64}},
-                {"text": _EXTRACT_PROMPT},
-            ]
-        else:
-            # Large file — upload via Files API first
-            file_uri = _upload_to_gemini_files(file_bytes, mime_type)
-            if not file_uri:
-                return None
-            parts = [
-                {"file_data": {"mime_type": mime_type, "file_uri": file_uri}},
-                {"text": _EXTRACT_PROMPT},
-            ]
-        return _call_gemini(parts)
-
-    # Excel / CSV → extract text, send as prompt
-    if ext in (".xlsx", ".xls", ".csv"):
-        import io
-        try:
-            df = pd.read_csv(io.BytesIO(file_bytes)) if ext == ".csv" \
-                 else pd.read_excel(io.BytesIO(file_bytes))
-            text_content = df.to_string(index=False, max_rows=300)
-        except Exception:
-            text_content = file_bytes.decode("utf-8", errors="ignore")[:10000]
-        parts = [{"text": f"هذا جدول بيانات من تقرير تحليل فني:\n\n{text_content}\n\n{_EXTRACT_PROMPT}"}]
-        return _call_gemini(parts)
-
-    # Plain text fallback
-    text_content = file_bytes.decode("utf-8", errors="ignore")[:10000]
-    parts = [{"text": f"هذا تقرير تحليل فني:\n\n{text_content}\n\n{_EXTRACT_PROMPT}"}]
-    return _call_gemini(parts)
-
-
-def parse_report(file_bytes: bytes, file_name: str,
-                 claude_client=None) -> Optional[Dict]:
-    """
-    Extract structured signals from a report file.
-    Primary engine  : Gemini 1.5 Flash (free, no credits needed)
-    Fallback engine : Claude SDK (used only if Gemini fails and claude_client provided)
-    Supports: PDF (text-based or image-based), PNG/JPG, Excel, CSV, TXT
-    Large PDFs (>15 MB) are uploaded via Gemini Files API automatically.
-    """
-    ext      = Path(file_name).suffix.lower()
-    raw_text = None
-
-    # ── Primary: Gemini ────────────────────────────────────────────────────
-    if GEMINI_API_KEY:
-        raw_text = _parse_with_gemini(file_bytes, ext)
-
-    # ── Fallback: Claude SDK ───────────────────────────────────────────────
-    if not raw_text and claude_client:
-        try:
-            mime_map = {".pdf": "application/pdf", ".png": "image/png",
-                        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
-            if ext in mime_map:
-                b64  = base64.standard_b64encode(file_bytes).decode("utf-8")
-                block = ({"type": "document",
-                           "source": {"type": "base64", "media_type": mime_map[ext], "data": b64}}
-                          if ext == ".pdf" else
-                          {"type": "image",
-                           "source": {"type": "base64", "media_type": mime_map[ext], "data": b64}})
-                resp = claude_client.messages.create(
-                    model="claude-sonnet-4-6", max_tokens=2000,
-                    messages=[{"role": "user",
-                                "content": [block, {"type": "text", "text": _EXTRACT_PROMPT}]}])
-            else:
-                text_content = file_bytes.decode("utf-8", errors="ignore")[:8000]
-                resp = claude_client.messages.create(
-                    model="claude-sonnet-4-6", max_tokens=2000,
-                    messages=[{"role": "user",
-                                "content": f"هذا تقرير:\n\n{text_content}\n\n{_EXTRACT_PROMPT}"}])
-            raw_text = resp.content[0].text.strip()
-        except Exception as e:
-            print(f"[Reports] Claude fallback error: {e}")
-
-    if not raw_text:
-        return {"signals": [], "report_summary": "فشل التحليل — لم يُستلم رد من Gemini أو Claude",
-                "error": "no_response"}
-
-    # Surface any Gemini HTTP/network error so the UI can display it
-    if isinstance(raw_text, str) and raw_text.startswith("__GEMINI_ERROR__"):
-        err_detail = raw_text.replace("__GEMINI_ERROR__", "")
-        return {"signals": [], "report_summary": f"Gemini API Error: {err_detail}",
-                "error": "gemini_api_error", "error_detail": err_detail}
-
+def _parse_json(raw: str) -> Optional[Dict]:
+    if not raw:
+        return None
     try:
-        clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+        clean = re.sub(r"```(?:json)?|```", "", raw).strip()
         return json.loads(clean)
-    except Exception as e:
-        return {"signals": [], "report_summary": f"خطأ في تحليل JSON: {e}",
-                "error": str(e), "raw": raw_text[:500]}
+    except Exception:
+        return None
 
-# ===========================================================================
-# 3. STORAGE
-# ===========================================================================
+def _merge_batches(results: List[Dict]) -> Dict:
+    """Merge signals from multiple page-batch calls."""
+    merged = {"report_type": "unknown", "report_date": None,
+              "market_overview": None, "signals": [], "report_summary": ""}
+    seen = set()
+    for r in results:
+        if not r:
+            continue
+        if r.get("report_type", "unknown") != "unknown":
+            merged["report_type"] = r["report_type"]
+        merged["report_date"]     = merged["report_date"]     or r.get("report_date")
+        merged["market_overview"] = merged["market_overview"] or r.get("market_overview")
+        merged["report_summary"]  = r.get("report_summary")  or merged["report_summary"]
+        for sig in r.get("signals", []):
+            sym = sig.get("symbol", "").upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                merged["signals"].append(sig)
+    return merged
 
+# ── MAIN PARSE ENTRY POINT ────────────────────────────────────────────────────
+def parse_report(file_bytes: bytes, file_name: str,
+                 claude_client=None) -> Dict:
+    """
+    Parse a report file → structured signals.
+    PDF/image → pymupdf pages → OpenRouter batches → merge.
+    Falls back to Gemini vision if OpenRouter fails.
+    """
+    ext = Path(file_name).suffix.lower()
+
+    # Convert to images
+    if ext == ".pdf":
+        images = _pdf_to_images(file_bytes)
+        if not images:
+            return {"signals": [], "error": "pdf_failed",
+                    "report_summary": "pymupdf could not open PDF"}
+    elif ext in (".png", ".jpg", ".jpeg", ".webp"):
+        images = [base64.b64encode(file_bytes).decode()]
+    else:
+        return {"signals": [], "error": "unsupported",
+                "report_summary": f"Unsupported format: {ext}"}
+
+    batch_results = []
+    for i in range(0, len(images), PAGES_PER_BATCH):
+        batch = images[i:i + PAGES_PER_BATCH]
+
+        # Primary: OpenRouter
+        raw = _call_openrouter(batch) if OPENROUTER_KEY else None
+
+        if raw and raw.startswith("__ERROR__"):
+            err = raw.replace("__ERROR__", "")
+            # Fallback to Gemini on error
+            raw = _call_gemini_vision(batch)
+            if not raw:
+                return {"signals": [], "error": "openrouter_error",
+                        "error_detail": err,
+                        "report_summary": f"OpenRouter Error: {err}"}
+
+        parsed = _parse_json(raw)
+        if parsed:
+            batch_results.append(parsed)
+
+    if not batch_results:
+        return {"signals": [], "error": "no_response",
+                "report_summary": "No response from vision engine"}
+
+    return _merge_batches(batch_results)
+
+# ── STORAGE ───────────────────────────────────────────────────────────────────
 def store_report_signals(filename: str, file_type: str,
-                          parsed: Dict, file_bytes: bytes) -> int:
-    """يحفظ التقرير والـ signals في DB. Returns report_id."""
-    conn   = _db()
-    valid  = (datetime.now() + timedelta(days=SIGNAL_TTL_DAYS)).strftime("%Y-%m-%d")
+                          parsed: Dict, drive_file_id: str = None) -> int:
+    conn  = _db()
+    valid = (datetime.now() + timedelta(days=SIGNAL_TTL_DAYS)).strftime("%Y-%m-%d")
 
     cur = conn.execute("""
-        INSERT INTO reports (filename, file_type, raw_text)
-        VALUES (?,?,?)
-    """, (filename, file_type, parsed.get("report_summary", "")))
-    report_id = cur.lastrowid
+        INSERT INTO reports
+            (filename, file_type, drive_file_id, raw_text, report_type, report_date, market_overview)
+        VALUES (?,?,?,?,?,?,?)
+    """, (filename, file_type, drive_file_id,
+          parsed.get("report_summary", ""),
+          parsed.get("report_type", ""),
+          parsed.get("report_date", ""),
+          parsed.get("market_overview", "")))
+    rid = cur.lastrowid
 
     for sig in parsed.get("signals", []):
-        symbol = sig.get("symbol", "").strip().upper()
-        if not symbol:
+        sym = sig.get("symbol", "").strip().upper()
+        if not sym:
             continue
-        # أضف .EGX لو مش موجودة
-        if not symbol.endswith(".EGX"):
-            symbol_full = symbol + ".EGX"
-        else:
-            symbol_full = symbol
-
+        sym_full = sym if sym.endswith(".EGX") else sym + ".EGX"
         conn.execute("""
-            INSERT INTO analyst_signals (
-                report_id, symbol, action,
-                entry_low, entry_high,
-                target1, target2, target3,
-                stop_loss, timeframe, confidence,
-                notes, valid_until
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            report_id, symbol_full,
-            sig.get("action", "WATCH"),
-            sig.get("entry_low"), sig.get("entry_high"),
-            sig.get("target1"), sig.get("target2"), sig.get("target3"),
-            sig.get("stop_loss"),
-            sig.get("timeframe", ""),
-            sig.get("confidence", "MEDIUM"),
-            sig.get("notes", ""),
-            valid,
-        ))
+            INSERT INTO analyst_signals
+                (report_id, symbol, action, entry_low, entry_high,
+                 target1, target2, target3, stop_loss,
+                 s1, s2, s3, r1, r2, r3,
+                 timeframe, confidence, pattern,
+                 rsi, volume_signal, notes, valid_until)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (rid, sym_full, sig.get("action", "WATCH"),
+              sig.get("entry_low"), sig.get("entry_high"),
+              sig.get("target1"), sig.get("target2"), sig.get("target3"),
+              sig.get("stop_loss"),
+              sig.get("s1"), sig.get("s2"), sig.get("s3"),
+              sig.get("r1"), sig.get("r2"), sig.get("r3"),
+              sig.get("timeframe", ""),
+              sig.get("confidence", "MEDIUM"),
+              sig.get("pattern", ""),
+              sig.get("rsi"), sig.get("volume_signal", ""),
+              sig.get("notes", ""), valid))
 
     conn.commit()
     conn.close()
-    return report_id
 
-# ===========================================================================
-# 4. SIGNAL RETRIEVAL — للاستخدام في get_egx_prediction()
-# ===========================================================================
+    if drive_file_id:
+        _mark_drive_analyzed(drive_file_id, filename, rid)
 
+    return rid
+
+# ── SIGNAL RETRIEVAL ──────────────────────────────────────────────────────────
 def get_active_signal(symbol: str) -> Optional[Dict]:
-    """
-    [INTEGRATION POINT]
-    يرجع أحدث analyst signal نشط للسهم ده.
-    أضف في get_egx_prediction() قبل return result:
-        result["analyst_signal"] = reports.get_active_signal(result["Symbol"])
-    """
     today = datetime.now().strftime("%Y-%m-%d")
     conn  = _db()
     row   = conn.execute("""
-        SELECT * FROM analyst_signals
-        WHERE symbol=? AND valid_until >= ?
-        ORDER BY created_at DESC LIMIT 1
+        SELECT s.*, r.report_type, r.market_overview, r.report_date, r.filename
+        FROM analyst_signals s
+        JOIN reports r ON s.report_id = r.id
+        WHERE s.symbol=? AND s.valid_until >= ?
+        ORDER BY s.created_at DESC LIMIT 1
     """, (symbol, today)).fetchone()
     conn.close()
-
-    if not row:
-        return None
-    return {
-        "action":     row["action"],
-        "entry_low":  row["entry_low"],
-        "entry_high": row["entry_high"],
-        "target1":    row["target1"],
-        "target2":    row["target2"],
-        "target3":    row["target3"],
-        "stop_loss":  row["stop_loss"],
-        "timeframe":  row["timeframe"],
-        "confidence": row["confidence"],
-        "notes":      row["notes"],
-        "valid_until":row["valid_until"],
-        "created_at": row["created_at"],
-    }
+    return dict(row) if row else None
 
 def get_all_active_signals() -> pd.DataFrame:
     today = datetime.now().strftime("%Y-%m-%d")
     conn  = _db()
-    cur = conn.execute("""
+    cur   = conn.execute("""
         SELECT s.symbol, s.action, s.entry_low, s.entry_high,
                s.target1, s.target2, s.stop_loss,
-               s.confidence, s.timeframe, s.notes,
-               s.valid_until, s.created_at,
-               r.filename
+               s.s1, s.r1, s.confidence, s.pattern,
+               s.valid_until, s.created_at, r.filename
         FROM analyst_signals s
         JOIN reports r ON s.report_id = r.id
         WHERE s.valid_until >= ?
@@ -438,10 +442,9 @@ def get_all_active_signals() -> pd.DataFrame:
 
 def get_reports_history(limit: int = 20) -> pd.DataFrame:
     conn = _db()
-    cur = conn.execute("""
-        SELECT r.id, r.filename, r.file_type,
-               COUNT(s.id) as signals_count,
-               r.uploaded_at
+    cur  = conn.execute("""
+        SELECT r.filename, r.report_type, r.report_date,
+               COUNT(s.id) as signals, r.uploaded_at
         FROM reports r
         LEFT JOIN analyst_signals s ON s.report_id = r.id
         GROUP BY r.id ORDER BY r.uploaded_at DESC LIMIT ?
@@ -451,209 +454,262 @@ def get_reports_history(limit: int = 20) -> pd.DataFrame:
     conn.close()
     return pd.DataFrame([dict(zip(cols, r)) for r in rows])
 
-# ===========================================================================
-# 5. VAMP CONFIDENCE ADJUSTMENT
-# ===========================================================================
-
-ACTION_MULTIPLIER = {
-    "BUY":   1.05,   # +5% على الـ target
-    "SELL": -1.05,   # عكس الإشارة
-    "HOLD":  1.00,
-    "WATCH": 1.00,
-}
-
-CONFIDENCE_BOOST = {"HIGH": 0.08, "MEDIUM": 0.04, "LOW": 0.01}
-
-def apply_analyst_signal(vamp_target: float, vamp_growth: float,
-                          signal: Optional[Dict]) -> Dict:
+# ── ALPHA RECOMMENDATION ──────────────────────────────────────────────────────
+def get_alpha_recommendation(symbol: str, current_alpha: float,
+                              current_target: float,
+                              current_price: float) -> Optional[Dict]:
     """
-    يدمج الـ analyst signal مع نتيجة VAMP.
-    Returns dict بالـ adjusted values.
+    Returns specific number adjustments to alpha score and price target
+    based on the latest Mubasher signal for this ticker.
     """
-    if not signal:
-        return {"adjusted_target": vamp_target, "adjusted_growth": vamp_growth,
-                "signal_applied": False}
+    sig = get_active_signal(symbol)
+    if not sig:
+        return None
 
-    action     = signal.get("action", "WATCH")
-    confidence = signal.get("confidence", "MEDIUM")
-    boost      = CONFIDENCE_BOOST.get(confidence, 0.04)
+    action     = sig.get("action", "WATCH")
+    confidence = sig.get("confidence", "LOW")
+    target1    = sig.get("target1")
 
-    if action == "BUY":
-        # رفع الـ target بنسبة الـ boost
-        adjusted_target = vamp_target * (1 + boost)
-    elif action == "SELL":
-        # خفض الـ target
-        adjusted_target = vamp_target * (1 - boost)
-    else:
-        adjusted_target = vamp_target
+    conf_mult  = {"HIGH": 0.12, "MEDIUM": 0.07, "LOW": 0.03}.get(confidence, 0.03)
+    direction  = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.3}.get(action)
+    if direction is None:
+        return None
 
-    current = vamp_target / (1 + vamp_growth / 100) if vamp_growth != -100 else vamp_target
-    adjusted_growth = (adjusted_target - current) / current * 100 if current > 0 else vamp_growth
+    alpha_delta = conf_mult * direction
+    new_alpha   = round(min(1.0, max(0.0, current_alpha + alpha_delta)), 3)
+
+    new_target = current_target
+    if target1 and current_price > 0:
+        mb_ret     = (target1 - current_price) / current_price
+        vamp_ret   = (current_target - current_price) / current_price
+        blended    = vamp_ret * 0.6 + mb_ret * 0.4
+        new_target = round(current_price * (1 + blended), 2)
+
+    stop = sig.get("stop_loss")
+    rr   = None
+    if stop and current_price > 0 and new_target > current_price:
+        risk   = current_price - stop
+        reward = new_target - current_price
+        rr     = round(reward / risk, 1) if risk > 0 else None
 
     return {
-        "adjusted_target": round(adjusted_target, 2),
-        "adjusted_growth": round(adjusted_growth, 2),
-        "signal_applied":  True,
-        "signal_action":   action,
-        "signal_boost":    boost,
+        "current_alpha":  round(current_alpha, 3),
+        "new_alpha":      new_alpha,
+        "alpha_delta":    f"{alpha_delta:+.3f}",
+        "current_target": round(current_target, 2),
+        "new_target":     new_target,
+        "target_delta":   f"{new_target - current_target:+.2f}",
+        "new_rr":         rr,
+        "action":         action,
+        "confidence":     confidence,
+        "pattern":        sig.get("pattern", ""),
+        "valid_until":    sig.get("valid_until", ""),
+        "source_file":    sig.get("filename", ""),
     }
 
-# ===========================================================================
-# 6. STREAMLIT TAB
-# ===========================================================================
-
+# ── STREAMLIT UI ──────────────────────────────────────────────────────────────
 def render_tab(claude_client=None):
-    """
-    Renders the Reports & Analyst Signals tab.
-    Primary engine: Gemini 1.5 Flash (free).
-    Fallback: Claude SDK (if available and Gemini fails).
-    """
     import streamlit as st
 
     st.header("📋 Reports & Analyst Signals")
-    st.caption("حمّل تقارير مباشر → Gemini يستخرج التوصيات ومستويات الدعم/المقاومة → تظهر كـ signal في Single Stock")
+    st.caption(
+        "Mubasher reports → OpenRouter vision → signals + S/R levels → "
+        "Single Stock panel with specific alpha recommendations"
+    )
 
-    if not GEMINI_API_KEY:
-        st.error("❌ GEMINI_API_KEY غير موجود — أضفه في Streamlit Secrets باسم GEMINI_API_KEY")
+    if not OPENROUTER_KEY:
+        st.error("❌ KIMI_API_KEY (OpenRouter) not found in Streamlit Secrets")
         return
 
-    engine_label = "🤖 Gemini 1.5 Flash"
-    if claude_client:
-        engine_label += " + Claude fallback"
-    st.caption(f"محرك التحليل: {engine_label} | الحد الأقصى للملف: 15 MB (inline) أو أكبر via Files API")
+    engine = f"🤖 OpenRouter ({OPENROUTER_MODEL})"
+    if GEMINI_KEY:
+        engine += " + Gemini fallback"
+    st.caption(engine)
 
-    # ── Gemini connectivity test ──────────────────────────────────────────
-    with st.expander("🔧 Gemini API Diagnostic", expanded=False):
-        if st.button("▶️ Test Gemini Connection", key="test_gemini_btn"):
-            with st.spinner("Testing Gemini API key…"):
-                test_result = _call_gemini([{"text": "Reply with the single word: OK"}])
-            if test_result and not test_result.startswith("__GEMINI_ERROR__"):
-                st.success(f"✅ Gemini working — response: {test_result.strip()[:80]}")
-            elif test_result:
-                err = test_result.replace("__GEMINI_ERROR__", "")
-                st.error(f"❌ Gemini failed:\n```\n{err}\n```")
-            else:
-                st.error("❌ No response — possible network block")
-
-    # ── Upload ────────────────────────────────────────────────────────────
-    st.subheader("📤 رفع تقرير جديد")
-    uploaded = st.file_uploader(
-        "اختار الملف (PDF / صورة / Excel / CSV)",
-        type=["pdf", "png", "jpg", "jpeg", "xlsx", "xls", "csv", "txt"],
-        key="report_uploader",
+    # ── Upload mode ───────────────────────────────────────────────────────
+    mode = st.radio(
+        "Source",
+        ["📁 Google Drive Folder", "📤 Manual Upload"],
+        horizontal=True, key="rpt_upload_mode",
     )
 
-    if uploaded:
-        file_bytes = uploaded.read()
-        file_ext   = Path(uploaded.name).suffix.lower()
-        size_kb    = len(file_bytes) / 1024
-
-        st.info(f"📄 {uploaded.name}  —  {size_kb:.1f} KB")
-
-        if st.button("🔍 تحليل التقرير", type="primary"):
-            with st.spinner("Gemini بيقرأ التقرير ويستخرج التوصيات ومستويات الدعم/المقاومة …"):
-                parsed = parse_report(file_bytes, uploaded.name, claude_client)
-
-            if not parsed:
-                st.error("فشل التحليل — تأكد من Gemini API key")
-                return
-
-            if parsed.get("error") == "gemini_api_error":
-                st.error(f"❌ Gemini API Error:\n```\n{parsed.get('error_detail','')}\n```")
-                st.info("الحل: تحقق من المفتاح في Streamlit Secrets أو جرّب مفتاح جديد من aistudio.google.com")
-                return
-
-            if parsed.get("error"):
-                st.warning(f"⚠️ {parsed.get('report_summary','')}")
-
-            signals = parsed.get("signals", [])
-            summary = parsed.get("report_summary", "")
-
-            if summary:
-                st.success(f"📝 {summary}")
-
-            if not signals:
-                st.warning("لم يتم استخراج توصيات من هذا التقرير")
-                store_report_signals(uploaded.name, file_ext, parsed, file_bytes)
-                return
-
-            # ── Report metadata ───────────────────────────────────────────
-            meta_cols = st.columns(3)
-            meta_cols[0].caption(f"📋 نوع التقرير: {parsed.get('report_type','—')}")
-            meta_cols[1].caption(f"📅 التاريخ: {parsed.get('report_date','—')}")
-            if parsed.get("market_overview"):
-                st.info(f"📊 نظرة السوق: {parsed['market_overview']}")
-
-            # ── Preview ───────────────────────────────────────────────────
-            st.subheader(f"✅ استُخرج {len(signals)} توصية")
-            preview_rows = []
-            for s in signals:
-                action = s.get("action", "?")
-                color  = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "WATCH": "⚪"}.get(action, "⚪")
-                preview_rows.append({
-                    "":         color,
-                    "Symbol":   s.get("symbol", ""),
-                    "Action":   action,
-                    "Entry":    f"{s.get('entry_low','')} – {s.get('entry_high','')}",
-                    "T1":       s.get("target1", ""),
-                    "T2":       s.get("target2", ""),
-                    "T3":       s.get("target3", ""),
-                    "Stop":     s.get("stop_loss", ""),
-                    "S1":       s.get("s1", ""),
-                    "S2":       s.get("s2", ""),
-                    "R1":       s.get("r1", ""),
-                    "R2":       s.get("r2", ""),
-                    "Pattern":  (s.get("pattern") or "")[:30],
-                    "Conf":     s.get("confidence", ""),
-                    "Notes":    (s.get("notes") or "")[:40],
-                })
-            st.dataframe(pd.DataFrame(preview_rows),
-                         hide_index=True, use_container_width=True)
-
-            if st.button("💾 حفظ التوصيات", type="secondary"):
-                report_id = store_report_signals(uploaded.name, file_ext, parsed, file_bytes)
-                st.success(f"✅ تم الحفظ — {len(signals)} توصية (صالحة {SIGNAL_TTL_DAYS} يوم)")
-                st.rerun()
-
-    st.divider()
-
-    # ── Active Signals ────────────────────────────────────────────────────
-    st.subheader("🎯 التوصيات النشطة")
-    active_df = get_all_active_signals()
-
-    if not active_df.empty:
-        # Color-code by action
-        def color_action(val):
-            colors = {"BUY":"background-color:#064e3b;color:#10b981",
-                      "SELL":"background-color:#4c0519;color:#f43f5e",
-                      "HOLD":"background-color:#1c1917;color:#f59e0b",
-                      "WATCH":"background-color:#1e293b;color:#94a3b8"}
-            return colors.get(val,"")
-
-        styled = active_df.style.map(color_action, subset=["action"])
-        st.dataframe(styled, hide_index=True, use_container_width=True)
-
-        # Conflict check مع VAMP
-        st.caption(f"⏳ التوصيات صالحة لـ {SIGNAL_TTL_DAYS} يوم من تاريخ الرفع")
+    if mode == "📁 Google Drive Folder":
+        _ui_drive(claude_client)
     else:
-        st.info("لا يوجد توصيات نشطة حالياً — ارفع تقريراً جديداً.")
+        _ui_manual(claude_client)
 
     st.divider()
 
-    # ── Reports History ───────────────────────────────────────────────────
-    st.subheader("📁 سجل التقارير")
-    try:
-        hist_df = get_reports_history(20)
-        if not hist_df.empty:
-            st.dataframe(hist_df, hide_index=True, use_container_width=True)
-        else:
-            st.info("لا يوجد تقارير محفوظة بعد.")
-    except Exception as _hist_err:
-        st.warning(f"⚠️ Could not load reports history: {_hist_err}")
+    # ── Active signals table ──────────────────────────────────────────────
+    st.subheader("🎯 Active Signals")
+    df_active = get_all_active_signals()
+    if df_active.empty:
+        st.info("No active signals — upload a report to start.")
+    else:
+        def _ca(val):
+            return {"BUY": "background-color:#064e3b;color:#10b981",
+                    "SELL": "background-color:#4c0519;color:#f43f5e",
+                    "HOLD": "background-color:#1c1917;color:#f59e0b",
+                    "WATCH": "background-color:#1e293b;color:#94a3b8"}.get(val, "")
+        st.dataframe(
+            df_active.style.map(_ca, subset=["action"]),
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(f"⏳ Signals valid for {SIGNAL_TTL_DAYS} days from upload")
 
     st.divider()
+
+    # ── Reports history ───────────────────────────────────────────────────
+    st.subheader("📁 Reports History")
+    df_hist = get_reports_history()
+    if not df_hist.empty:
+        st.dataframe(df_hist, hide_index=True, use_container_width=True)
+    else:
+        st.info("No reports yet.")
+
     st.caption(
-        f"DB: {REPORTS_DB.name}  |  "
-        f"Signal TTL: {SIGNAL_TTL_DAYS} days  |  "
-        "Powered by Claude API (vision + text)"
+        f"DB: {REPORTS_DB.name} | TTL: {SIGNAL_TTL_DAYS} days | "
+        f"Engine: OpenRouter {OPENROUTER_MODEL}"
     )
+
+
+def _ui_drive(claude_client):
+    import streamlit as st
+
+    folder_url = st.text_input(
+        "Google Drive folder URL",
+        placeholder="https://drive.google.com/drive/folders/...",
+        key="drive_folder_url",
+    )
+    if not folder_url.strip():
+        return
+
+    folder_id = _extract_folder_id(folder_url)
+    if not folder_id:
+        st.error("❌ Could not extract folder ID — paste the full Drive folder URL")
+        return
+
+    with st.spinner("Loading folder…"):
+        files = _list_drive_folder(folder_id)
+
+    if not files:
+        st.warning("No PDFs found — make sure folder is shared as 'Anyone with link'")
+        return
+
+    tagged  = [{**f, "done": is_drive_analyzed(f["id"])} for f in files]
+    new_f   = [f for f in tagged if not f["done"]]
+    done_f  = [f for f in tagged if f["done"]]
+
+    st.success(
+        f"📂 {len(files)} PDFs found — "
+        f"🆕 {len(new_f)} new | ✅ {len(done_f)} already analyzed"
+    )
+
+    if not new_f:
+        st.info("✅ All files already analyzed — upload new reports to continue.")
+        return
+
+    selected = st.multiselect(
+        "Select reports to analyze",
+        options=[f["name"] for f in new_f],
+        default=[f["name"] for f in new_f],
+        key="drive_selected",
+    )
+
+    if not selected:
+        return
+
+    if st.button("🔍 Analyze Selected", type="primary", key="drive_analyze_btn"):
+        to_proc = [f for f in new_f if f["name"] in selected]
+        bar     = st.progress(0)
+
+        for idx, f in enumerate(to_proc):
+            st.caption(f"⏳ {f['name']} ({idx+1}/{len(to_proc)})")
+
+            pdf_bytes = _download_drive_file(f["id"])
+            if not pdf_bytes:
+                st.warning(f"⚠️ Could not download: {f['name']}")
+                bar.progress((idx + 1) / len(to_proc))
+                continue
+
+            parsed = parse_report(pdf_bytes, f["name"], claude_client)
+
+            if parsed.get("error") == "openrouter_error":
+                st.error(f"❌ {f['name']}: {parsed.get('error_detail','')}")
+                bar.progress((idx + 1) / len(to_proc))
+                continue
+
+            sigs = parsed.get("signals", [])
+            store_report_signals(f["name"], ".pdf", parsed, drive_file_id=f["id"])
+
+            st.success(f"✅ {f['name']}: {len(sigs)} signals")
+            if parsed.get("market_overview"):
+                st.caption(f"📊 {parsed['market_overview']}")
+
+            bar.progress((idx + 1) / len(to_proc))
+
+        bar.empty()
+        st.rerun()
+
+
+def _ui_manual(claude_client):
+    import streamlit as st
+
+    uploaded = st.file_uploader(
+        "Upload file (PDF / image / Excel / CSV)",
+        type=["pdf", "png", "jpg", "jpeg", "xlsx", "xls", "csv", "txt"],
+        key="manual_upload",
+    )
+    if not uploaded:
+        return
+
+    file_bytes = uploaded.read()
+    st.info(f"📄 {uploaded.name}  —  {len(file_bytes)/1024:.1f} KB")
+
+    if st.button("🔍 Analyze Report", type="primary", key="manual_analyze_btn"):
+        with st.spinner("Analyzing pages…"):
+            parsed = parse_report(file_bytes, uploaded.name, claude_client)
+
+        if parsed.get("error") == "openrouter_error":
+            st.error(f"❌ OpenRouter Error: {parsed.get('error_detail','')}")
+            return
+
+        sigs = parsed.get("signals", [])
+        if parsed.get("report_summary"):
+            st.success(f"📝 {parsed['report_summary']}")
+        if parsed.get("market_overview"):
+            st.info(f"📊 Market: {parsed['market_overview']}")
+
+        if not sigs:
+            st.warning("No recommendations extracted")
+            store_report_signals(uploaded.name, Path(uploaded.name).suffix.lower(), parsed)
+            return
+
+        # Preview table
+        st.subheader(f"✅ {len(sigs)} signals extracted")
+        rows = []
+        for s in sigs:
+            act   = s.get("action", "?")
+            color = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "WATCH": "⚪"}.get(act, "⚪")
+            rows.append({
+                "":       color,
+                "Symbol": s.get("symbol", ""),
+                "Action": act,
+                "Entry":  f"{s.get('entry_low','')} – {s.get('entry_high','')}",
+                "T1":     s.get("target1", ""),
+                "T2":     s.get("target2", ""),
+                "Stop":   s.get("stop_loss", ""),
+                "S1/R1":  f"{s.get('s1','')} / {s.get('r1','')}",
+                "Pattern":(s.get("pattern") or "")[:25],
+                "Conf":   s.get("confidence", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        if st.button("💾 Save Signals", type="secondary", key="manual_save_btn"):
+            store_report_signals(
+                uploaded.name,
+                Path(uploaded.name).suffix.lower(),
+                parsed,
+            )
+            st.success(f"✅ {len(sigs)} signals saved (valid {SIGNAL_TTL_DAYS} days)")
+            st.rerun()

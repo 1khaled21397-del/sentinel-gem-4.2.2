@@ -440,22 +440,82 @@ with tab2:
     t0      = is_t0_eligible(ticker)
     st.caption(f"Segment: {segment} | T+0: {'✅ Eligible' if t0 else '⏳ T+1 Only'}")
 
-    # Analyst signal banner (from sentinel_reports, NEW)
+    # ── Mubasher Insight Panel ────────────────────────────────────────────
     if reports and MODULES_AVAILABLE.get("sentinel_reports"):
         try:
-            active_sig = reports.get_active_signal(ticker)
-            if active_sig:
-                action = active_sig.get("action", "WATCH")
-                colour = {"BUY": "🟢", "STRONG_BUY": "🟢🟢",
-                          "SELL": "🔴", "STRONG_SELL": "🔴🔴",
-                          "HOLD": "🟡", "WATCH": "⚪"}.get(action, "⚪")
-                st.info(
-                    f"📋 **Analyst Signal:** {colour} {action}  |  "
-                    f"Confidence: {active_sig.get('confidence','—')}  |  "
-                    f"Entry: {active_sig.get('entry_low','—')}–{active_sig.get('entry_high','—')}  |  "
-                    f"Target 1: {active_sig.get('target1','—')}  |  "
-                    f"Valid until: {str(active_sig.get('valid_until','—'))[:10]}"
-                )
+            sig = reports.get_active_signal(ticker)
+            if sig:
+                action  = sig.get("action", "WATCH")
+                colour  = {"BUY":"🟢","STRONG_BUY":"🟢🟢","SELL":"🔴",
+                           "STRONG_SELL":"🔴🔴","HOLD":"🟡","WATCH":"⚪"}.get(action,"⚪")
+                conf    = sig.get("confidence","—")
+
+                with st.expander(
+                    f"📋 Mubasher Signal: {colour} {action} | {conf} confidence "
+                    f"| {sig.get('report_type','—')} {str(sig.get('report_date',''))[:10]}",
+                    expanded=True
+                ):
+                    # Price levels
+                    pc1, pc2, pc3, pc4 = st.columns(4)
+                    pc1.metric("Entry Zone",
+                               f"{sig.get('entry_low','—')} – {sig.get('entry_high','—')}")
+                    pc2.metric("Target 1",  str(sig.get("target1","—")))
+                    pc3.metric("Target 2",  str(sig.get("target2","—")))
+                    pc4.metric("Stop Loss", str(sig.get("stop_loss","—")))
+
+                    # S/R levels
+                    sr1, sr2, sr3, sr4, sr5, sr6 = st.columns(6)
+                    sr1.metric("S1", str(sig.get("s1","—")))
+                    sr2.metric("S2", str(sig.get("s2","—")))
+                    sr3.metric("S3", str(sig.get("s3","—")))
+                    sr4.metric("R1", str(sig.get("r1","—")))
+                    sr5.metric("R2", str(sig.get("r2","—")))
+                    sr6.metric("R3", str(sig.get("r3","—")))
+
+                    if sig.get("pattern"):
+                        st.caption(f"📐 Pattern: {sig['pattern']}")
+                    if sig.get("market_overview"):
+                        st.caption(f"📊 Market: {sig['market_overview']}")
+
+                    st.divider()
+                    st.markdown("**📈 Alpha Score Recommendations**")
+                    st.caption(
+                        "Based on Mubasher signal blended with VAMP (60/40). "
+                        "Accept or ignore — pipeline is unchanged until you decide."
+                    )
+                    try:
+                        from data_engine import fetch_and_build
+                        df_tmp  = fetch_and_build(ticker,"EGX",lookback=60,use_cache=True)
+                        c_price = float(df_tmp["close"].iloc[-1])
+                        from technical_analysis import analyze_ticker
+                        sn_tmp, su_tmp = analyze_ticker(
+                            df_tmp, ticker, get_ticker_segment(ticker)
+                        )
+                        c_alpha  = 0.55   # default — pipeline score unavailable here
+                        c_target = float(sn_tmp.take_profit)
+
+                        rec = reports.get_alpha_recommendation(
+                            ticker, c_alpha, c_target, c_price
+                        )
+                        if rec:
+                            rc1, rc2, rc3, rc4 = st.columns(4)
+                            rc1.metric("Current Price",  f"{c_price:.2f}")
+                            rc2.metric("Alpha Now → Rec",
+                                       f"{rec['current_alpha']} → {rec['new_alpha']}",
+                                       delta=rec["alpha_delta"])
+                            rc3.metric("Target Now → Rec",
+                                       f"{rec['current_target']} → {rec['new_target']}",
+                                       delta=rec["target_delta"])
+                            rc4.metric("New R/R",
+                                       f"{rec['new_rr']}:1" if rec["new_rr"] else "—")
+                            st.caption(
+                                f"✅ Valid until {rec['valid_until']} | "
+                                f"Source: {rec['source_file']}"
+                            )
+                    except Exception:
+                        st.caption("Alpha recommendation requires price data")
+            else:
+                st.caption("📋 No active Mubasher signal for this ticker")
         except Exception:
             pass
 
